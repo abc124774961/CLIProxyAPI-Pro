@@ -59,6 +59,10 @@ type codexOAuthService interface {
 	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
 }
 
+type authFileImportDefaults struct {
+	Websockets *bool
+}
+
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
@@ -739,6 +743,11 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	importDefaults, errDefaults := authFileImportDefaultsFromRequest(c)
+	if errDefaults != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errDefaults.Error()})
+		return
+	}
 
 	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
 	if errMultipart != nil {
@@ -746,7 +755,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if len(fileHeaders) == 1 {
-		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
+		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0], importDefaults); errUpload != nil {
 			if errors.Is(errUpload, errAuthFileMustBeJSON) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
@@ -761,7 +770,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		uploaded := make([]string, 0, len(fileHeaders))
 		failed := make([]gin.H, 0)
 		for _, file := range fileHeaders {
-			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			name, errUpload := h.storeUploadedAuthFile(ctx, file, importDefaults)
 			if errUpload != nil {
 				failureName := ""
 				if file != nil {
@@ -806,11 +815,42 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+	if err = h.writeAuthFileWithDefaults(ctx, filepath.Base(name), data, importDefaults); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func authFileImportDefaultsFromRequest(c *gin.Context) (authFileImportDefaults, error) {
+	var defaults authFileImportDefaults
+	if c == nil {
+		return defaults, nil
+	}
+
+	raw, exists := c.GetQuery("default_websockets")
+	if c.ContentType() == "multipart/form-data" {
+		form, err := c.MultipartForm()
+		if err != nil {
+			return defaults, fmt.Errorf("invalid multipart form: %w", err)
+		}
+		if form != nil {
+			if values := form.Value["default_websockets"]; len(values) > 0 {
+				raw = values[len(values)-1]
+				exists = true
+			}
+		}
+	}
+	if !exists {
+		return defaults, nil
+	}
+
+	parsed, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return defaults, errors.New("default_websockets must be a boolean")
+	}
+	defaults.Websockets = &parsed
+	return defaults, nil
 }
 
 // Delete auth files: single by name or all
@@ -919,7 +959,11 @@ func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHea
 	return headers, nil
 }
 
-func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+func (h *Handler) storeUploadedAuthFile(
+	ctx context.Context,
+	file *multipart.FileHeader,
+	defaults authFileImportDefaults,
+) (string, error) {
 	if file == nil {
 		return "", fmt.Errorf("no file uploaded")
 	}
@@ -937,19 +981,29 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 	if err != nil {
 		return "", fmt.Errorf("failed to read uploaded file: %w", err)
 	}
-	if err := h.writeAuthFile(ctx, name, data); err != nil {
+	if err := h.writeAuthFileWithDefaults(ctx, name, data, defaults); err != nil {
 		return "", err
 	}
 	return name, nil
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	return h.writeAuthFileWithDefaults(ctx, name, data, authFileImportDefaults{})
+}
+
+func (h *Handler) writeAuthFileWithDefaults(
+	ctx context.Context,
+	name string,
+	data []byte,
+	defaults authFileImportDefaults,
+) error {
 	imports, handled, errBundle := codex.ParseAgentIdentityBundle(data)
 	if errBundle != nil {
 		return errBundle
 	}
 	if handled {
 		for _, item := range imports {
+			applyAuthFileImportDefaults(item.Metadata, defaults)
 			canonical, errMarshal := json.MarshalIndent(item.Metadata, "", "  ")
 			if errMarshal != nil {
 				return fmt.Errorf("serialize agent identity auth file: %w", errMarshal)
@@ -968,6 +1022,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	}
 	if handled {
 		for _, item := range sub2Imports {
+			applyAuthFileImportDefaults(item.Metadata, defaults)
 			canonical, errMarshal := json.MarshalIndent(item.Metadata, "", "  ")
 			if errMarshal != nil {
 				return fmt.Errorf("serialize Sub2 auth file: %w", errMarshal)
@@ -980,7 +1035,47 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		log.Infof("imported %d Sub2 auth files", len(sub2Imports))
 		return nil
 	}
-	return h.writeSingleAuthFile(ctx, name, data)
+	dataWithDefaults, errDefaults := applyAuthFileImportDefaultsToData(data, defaults)
+	if errDefaults != nil {
+		return errDefaults
+	}
+	return h.writeSingleAuthFile(ctx, name, dataWithDefaults)
+}
+
+func applyAuthFileImportDefaults(metadata map[string]any, defaults authFileImportDefaults) bool {
+	if len(metadata) == 0 || defaults.Websockets == nil {
+		return false
+	}
+	provider, _ := metadata["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return false
+	}
+	if _, exists := metadata["websockets"]; exists {
+		return false
+	}
+	metadata["websockets"] = *defaults.Websockets
+	return true
+}
+
+func applyAuthFileImportDefaultsToData(
+	data []byte,
+	defaults authFileImportDefaults,
+) ([]byte, error) {
+	if defaults.Websockets == nil {
+		return data, nil
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, fmt.Errorf("invalid auth file: %w", err)
+	}
+	if !applyAuthFileImportDefaults(metadata, defaults) {
+		return data, nil
+	}
+	canonical, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("serialize auth file defaults: %w", err)
+	}
+	return append(canonical, '\n'), nil
 }
 
 func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []byte) error {

@@ -37,7 +37,13 @@ func TestWriteAuthFileExpandsSub2Bundle(t *testing.T) {
 		t.Fatalf("Marshal: %v", err)
 	}
 	handler := &Handler{cfg: &config.Config{AuthDir: authDir}}
-	if err := handler.writeAuthFile(context.Background(), "sub2-export.json", payload); err != nil {
+	websockets := true
+	if err := handler.writeAuthFileWithDefaults(
+		context.Background(),
+		"sub2-export.json",
+		payload,
+		authFileImportDefaults{Websockets: &websockets},
+	); err != nil {
 		t.Fatalf("writeAuthFile: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(authDir, "sub2-export.json")); !os.IsNotExist(err) {
@@ -64,6 +70,13 @@ func TestWriteAuthFileExpandsSub2Bundle(t *testing.T) {
 		}, filepath.Join(authDir, entry.Name()), data)
 		if len(auths) != 1 || auths[0].Provider != "codex" {
 			t.Fatalf("generated file %q is not a runnable Codex auth", entry.Name())
+		}
+		var metadata map[string]any
+		if err = json.Unmarshal(data, &metadata); err != nil {
+			t.Fatalf("decode generated file %q: %v", entry.Name(), err)
+		}
+		if enabled, ok := metadata["websockets"].(bool); !ok || !enabled {
+			t.Fatalf("generated file %q websockets = %#v, want true", entry.Name(), metadata["websockets"])
 		}
 	}
 }
