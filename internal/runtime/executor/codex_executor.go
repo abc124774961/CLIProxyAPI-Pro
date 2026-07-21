@@ -1074,9 +1074,12 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 		return nil
 	}
 	apiKey, _ := codexCreds(auth)
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+	httpClient := helps.NewUtlsHTTPClient(req.Context(), e.cfg, auth, 0)
+	authorization, _, err := helps.PrepareCodexAuthorization(req.Context(), auth, httpClient, apiKey)
+	if err != nil {
+		return err
 	}
+	setCodexAuthorizationHeader(req.Header, authorization)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -1094,11 +1097,19 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		ctx = req.Context()
 	}
 	httpReq := req.WithContext(ctx)
-	if err := e.PrepareRequest(httpReq, auth); err != nil {
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	apiKey, _ := codexCreds(auth)
+	authorization, taskID, err := helps.PrepareCodexAuthorization(ctx, auth, httpClient, apiKey)
+	if err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	setCodexAuthorizationHeader(httpReq.Header, authorization)
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+	return helps.DoCodexRequestWithAgentRecovery(ctx, auth, httpClient, httpClient, httpReq, taskID)
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -1160,7 +1171,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	authClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return resp, errAuthorization
+	}
+	applyCodexHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1180,9 +1196,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -1315,7 +1331,12 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	authClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return resp, errAuthorization
+	}
+	applyCodexHeaders(httpReq, auth, authorization, false, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1335,9 +1356,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -1430,7 +1451,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	authClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return nil, errAuthorization
+	}
+	applyCodexHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1451,9 +1477,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
@@ -1983,9 +2009,9 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
-func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
+func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, authorization string, stream bool, cfg *config.Config, ginHeaders http.Header) {
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
+	setCodexAuthorizationHeader(r.Header, authorization)
 
 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
@@ -2030,6 +2056,23 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+func setCodexAuthorizationHeader(headers http.Header, authorization string) {
+	if headers == nil {
+		return
+	}
+	authorization = strings.TrimSpace(authorization)
+	if authorization == "" {
+		headers.Del("Authorization")
+		return
+	}
+	lower := strings.ToLower(authorization)
+	if strings.HasPrefix(lower, "bearer ") || strings.HasPrefix(lower, "agentassertion ") {
+		headers.Set("Authorization", authorization)
+		return
+	}
+	headers.Set("Authorization", "Bearer "+authorization)
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {

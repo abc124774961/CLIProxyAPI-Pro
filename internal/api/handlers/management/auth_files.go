@@ -944,6 +944,46 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	imports, handled, errBundle := codex.ParseAgentIdentityBundle(data)
+	if errBundle != nil {
+		return errBundle
+	}
+	if handled {
+		for _, item := range imports {
+			canonical, errMarshal := json.MarshalIndent(item.Metadata, "", "  ")
+			if errMarshal != nil {
+				return fmt.Errorf("serialize agent identity auth file: %w", errMarshal)
+			}
+			canonical = append(canonical, '\n')
+			if errWrite := h.writeSingleAuthFile(ctx, item.FileName, canonical); errWrite != nil {
+				return errWrite
+			}
+		}
+		log.Infof("imported %d agent identity auth files", len(imports))
+		return nil
+	}
+	sub2Imports, handled, errBundle := codex.ParseSub2Bundle(data)
+	if errBundle != nil {
+		return errBundle
+	}
+	if handled {
+		for _, item := range sub2Imports {
+			canonical, errMarshal := json.MarshalIndent(item.Metadata, "", "  ")
+			if errMarshal != nil {
+				return fmt.Errorf("serialize Sub2 auth file: %w", errMarshal)
+			}
+			canonical = append(canonical, '\n')
+			if errWrite := h.writeSingleAuthFile(ctx, item.FileName, canonical); errWrite != nil {
+				return errWrite
+			}
+		}
+		log.Infof("imported %d Sub2 auth files", len(sub2Imports))
+		return nil
+	}
+	return h.writeSingleAuthFile(ctx, name, data)
+}
+
+func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []byte) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
@@ -1161,6 +1201,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("invalid auth file: %w", err)
 	}
+	if _, handled, errAgentIdentity := codex.ParseAgentIdentityMetadata(metadata); handled && errAgentIdentity != nil {
+		return nil, fmt.Errorf("invalid agent identity auth file: %w", errAgentIdentity)
+	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
@@ -1214,7 +1257,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 				auth.LastRefreshedAt = existing.LastRefreshedAt
 			}
 			auth.NextRefreshAfter = existing.NextRefreshAfter
-			auth.Runtime = existing.Runtime
+			if auth.Runtime == nil {
+				auth.Runtime = existing.Runtime
+			}
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)

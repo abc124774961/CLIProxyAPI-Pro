@@ -112,14 +112,19 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	if errCache != nil {
 		return resp, errCache
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	authClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return resp, errAuthorization
+	}
+	applyCodexHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, mainModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
@@ -209,14 +214,19 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	if errCache != nil {
 		return nil, errCache
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	authClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return nil, errAuthorization
+	}
+	applyCodexHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, mainModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
@@ -336,7 +346,12 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	if errCache != nil {
 		return resp, errCache
 	}
-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, false, e.cfg)
+	authClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return resp, errAuthorization
+	}
+	applyCodexDirectImageHeaders(httpReq, auth, authorization, false, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, model)
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
@@ -344,9 +359,9 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
@@ -397,7 +412,12 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	if errCache != nil {
 		return nil, errCache
 	}
-	applyCodexDirectImageHeaders(httpReq, auth, apiKey, true, e.cfg)
+	authClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	authorization, agentTaskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, authClient, apiKey)
+	if errAuthorization != nil {
+		return nil, errAuthorization
+	}
+	applyCodexDirectImageHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, model)
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
@@ -405,9 +425,9 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := authClient
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := helps.DoCodexRequestWithAgentRecovery(ctx, auth, authClient, httpClient, httpReq, agentTaskID)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo

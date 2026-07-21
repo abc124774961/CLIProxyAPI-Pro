@@ -172,11 +172,11 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
+func preferCodexWebsocketAuths(ctx context.Context, provider string, opts cliproxyexecutor.Options, available []*Auth) []*Auth {
 	if len(available) == 0 {
 		return available
 	}
-	if !cliproxyexecutor.DownstreamWebsocket(ctx) {
+	if !cliproxyexecutor.DownstreamWebsocket(ctx) && !(opts.Stream && strings.EqualFold(strings.TrimSpace(provider), "codex")) {
 		return available
 	}
 	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
@@ -255,13 +255,12 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, opts, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -292,13 +291,12 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, opts, available)
 	return available[0], nil
 }
 
