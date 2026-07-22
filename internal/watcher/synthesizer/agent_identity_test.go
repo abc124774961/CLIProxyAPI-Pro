@@ -7,11 +7,13 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
@@ -70,18 +72,19 @@ func TestSynthesizeAgentIdentityAuthFile(t *testing.T) {
 
 func TestPersistAgentIdentityTask(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "codex-agent.json")
+	privateKey := testAgentIdentityKey(t)
 	metadata := map[string]any{
 		"type":              "codex",
 		"auth_mode":         "agentIdentity",
 		"agent_runtime_id":  "runtime-persist",
-		"agent_private_key": testAgentIdentityKey(t),
+		"agent_private_key": privateKey,
 		"task_id":           "task-old",
 	}
 	data, _ := json.Marshal(metadata)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := persistAgentIdentityTask(context.Background(), path, "runtime-persist", "task-new"); err != nil {
+	if err := persistAgentIdentityTask(context.Background(), path, "runtime-persist", privateKey, "task-new"); err != nil {
 		t.Fatalf("persistAgentIdentityTask: %v", err)
 	}
 	updated, err := os.ReadFile(path)
@@ -94,6 +97,110 @@ func TestPersistAgentIdentityTask(t *testing.T) {
 	}
 	if got["task_id"] != "task-new" {
 		t.Fatalf("task_id = %v, want task-new", got["task_id"])
+	}
+}
+
+func TestPersistAgentIdentityTaskRejectsReplacedCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex-agent.json")
+	originalKey := testAgentIdentityKey(t)
+	replacementKey := testAgentIdentityKey(t)
+	metadata := map[string]any{
+		"type":              "codex",
+		"auth_mode":         "agentIdentity",
+		"agent_runtime_id":  "runtime-reused",
+		"agent_private_key": replacementKey,
+		"task_id":           "task-replacement",
+	}
+	data, _ := json.Marshal(metadata)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := persistAgentIdentityTask(context.Background(), path, "runtime-reused", originalKey, "task-stale"); !errors.Is(err, codexauth.ErrAgentIdentityCredentialsChanged) {
+		t.Fatalf("persistence error = %v, want credentials changed", err)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(updated, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got["task_id"] != "task-replacement" {
+		t.Fatalf("task_id = %v, want task-replacement", got["task_id"])
+	}
+}
+
+func TestPersistAgentIdentityRuntimeDeletedState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex-agent.json")
+	privateKey := testAgentIdentityKey(t)
+	metadata := map[string]any{
+		"type":              "codex",
+		"auth_mode":         "agentIdentity",
+		"agent_runtime_id":  "runtime-deleted",
+		"agent_private_key": privateKey,
+		"agentIdentity": map[string]any{
+			"taskId": "task-nested-stale",
+		},
+		"task_id": "task-stale",
+	}
+	data, _ := json.Marshal(metadata)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if err := persistAgentIdentityTask(context.Background(), path, "runtime-deleted", privateKey, ""); err != nil {
+		t.Fatalf("persistAgentIdentityTask deleted state: %v", err)
+	}
+	updated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(updated, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	credentials, handled, err := codexauth.ParseAgentIdentityMetadata(got)
+	if err != nil || !handled {
+		t.Fatalf("ParseAgentIdentityMetadata handled=%v err=%v", handled, err)
+	}
+	if credentials.TaskID != "" {
+		t.Fatalf("persisted task = %q, want empty", credentials.TaskID)
+	}
+	if got[agentIdentityRegistrationStateKey] != codexauth.AgentIdentityRegistrationRuntimeDeleted {
+		t.Fatalf("registration state marker = %v", got[agentIdentityRegistrationStateKey])
+	}
+}
+
+func TestSynthesizeRestoresDeletedAgentIdentityRuntime(t *testing.T) {
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "codex-agent.json")
+	metadata := map[string]any{
+		"type":                            "codex",
+		"auth_mode":                       "agentIdentity",
+		"agent_runtime_id":                "runtime-deleted",
+		"agent_private_key":               testAgentIdentityKey(t),
+		"task_id":                         "task-must-not-reactivate",
+		agentIdentityRegistrationStateKey: codexauth.AgentIdentityRegistrationRuntimeDeleted,
+	}
+	data, _ := json.Marshal(metadata)
+	auths := SynthesizeAuthFile(&SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}, path, data)
+	if len(auths) != 1 {
+		t.Fatalf("auths = %d, want 1", len(auths))
+	}
+	runtime, ok := auths[0].Runtime.(*agentIdentityRuntime)
+	if !ok || runtime == nil {
+		t.Fatalf("runtime type = %T", auths[0].Runtime)
+	}
+	status := runtime.RegistrationStatus()
+	if status.State != codexauth.AgentIdentityRegistrationRuntimeDeleted || runtime.RuntimeSelectionAvailable() {
+		t.Fatalf("restored runtime status = %+v available=%v", status, runtime.RuntimeSelectionAvailable())
 	}
 }
 

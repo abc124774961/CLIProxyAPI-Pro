@@ -14,6 +14,35 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+type runtimeSelectionAvailabilityStub bool
+
+func (s runtimeSelectionAvailabilityStub) RuntimeSelectionAvailable() bool {
+	return bool(s)
+}
+
+func TestIsAuthBlockedForModelHonorsRuntimeAvailability(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+
+	blocked, reason, _ := isAuthBlockedForModel(&Auth{
+		ID:      "agent-registering",
+		Status:  StatusActive,
+		Runtime: runtimeSelectionAvailabilityStub(false),
+	}, "gpt-test", now)
+	if !blocked || reason != blockReasonOther {
+		t.Fatalf("blocked=%v reason=%v, want runtime block", blocked, reason)
+	}
+
+	blocked, reason, _ = isAuthBlockedForModel(&Auth{
+		ID:      "agent-ready",
+		Status:  StatusActive,
+		Runtime: runtimeSelectionAvailabilityStub(true),
+	}, "gpt-test", now)
+	if blocked || reason != blockReasonNone {
+		t.Fatalf("blocked=%v reason=%v, want available", blocked, reason)
+	}
+}
+
 func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	t.Parallel()
 

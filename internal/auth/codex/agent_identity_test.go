@@ -128,6 +128,9 @@ func TestAgentIdentityTaskRegistrationPlainAndEncrypted(t *testing.T) {
 
 func TestAgentIdentityConcurrentRegistrationIsSingleFlight(t *testing.T) {
 	runtime, _, _ := newTestAgentIdentity(t, "runtime-concurrent", "")
+	coordinator := newAgentIdentityRegistrationCoordinator(2, 32, 3, time.Millisecond, 5*time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
 	var registrations atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		registrations.Add(1)
@@ -144,29 +147,200 @@ func TestAgentIdentityConcurrentRegistrationIsSingleFlight(t *testing.T) {
 		persisted.Add(1)
 		return nil
 	})
+	runtime.SetRegistrationClient(server.Client())
 	var wg sync.WaitGroup
-	errs := make(chan error, 20)
+	statuses := make(chan AgentIdentityRegistrationStatus, 20)
 	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, err := runtime.Authorization(context.Background(), server.Client())
-			errs <- err
+			status, _ := runtime.StartTaskRegistration()
+			statuses <- status
 		}()
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("Authorization: %v", err)
+	close(statuses)
+	for status := range statuses {
+		if status.State != AgentIdentityRegistrationQueued && status.State != AgentIdentityRegistrationRegistering {
+			t.Fatalf("registration state = %q", status.State)
 		}
 	}
+	waitForAgentIdentityRegistrationState(t, runtime, AgentIdentityRegistrationReady)
 	if got := registrations.Load(); got != 1 {
 		t.Fatalf("registrations = %d, want 1", got)
 	}
 	if got := persisted.Load(); got != 1 {
 		t.Fatalf("persistence calls = %d, want 1", got)
 	}
+	if _, taskID, err := runtime.Authorization(context.Background(), server.Client()); err != nil || taskID != "task-shared" {
+		t.Fatalf("Authorization after registration task=%q err=%v", taskID, err)
+	}
+}
+
+func TestAgentIdentityRegistrationRetriesTransientFailure(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-retry", "")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 8, 3, time.Millisecond, 2*time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"temporarily unavailable"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"task_id":"task-recovered"}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+	runtime.SetRegistrationClient(server.Client())
+
+	if _, queued := runtime.StartTaskRegistration(); !queued {
+		t.Fatal("missing task was not queued")
+	}
+	status := waitForAgentIdentityRegistrationState(t, runtime, AgentIdentityRegistrationReady)
+	if status.Attempts != 2 || attempts.Load() != 2 {
+		t.Fatalf("status attempts=%d HTTP attempts=%d, want 2", status.Attempts, attempts.Load())
+	}
+}
+
+func TestAgentIdentityRegistrationStopsWhenRuntimeDeleted(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-deleted", "")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 8, 5, time.Millisecond, 2*time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
+
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"biscuit_baker_service_agent_error_status","message":"Agent runtime has been deleted."}}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+	runtime.SetRegistrationClient(server.Client())
+
+	if _, queued := runtime.StartTaskRegistration(); !queued {
+		t.Fatal("missing task was not queued")
+	}
+	status := waitForAgentIdentityRegistrationState(t, runtime, AgentIdentityRegistrationRuntimeDeleted)
+	if attempts.Load() != 1 || status.CanRetry || status.Active {
+		t.Fatalf("attempts=%d status=%+v", attempts.Load(), status)
+	}
+	if _, queued := runtime.RetryTaskRegistration(); queued {
+		t.Fatal("deleted runtime must not be manually requeued")
+	}
+}
+
+func TestAgentIdentityRuntimeDeletedWinsOverInFlightRegistration(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-deleted-in-flight", "")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 8, 3, time.Millisecond, 2*time.Millisecond)
+	runtime.registrationCoordinator = coordinator
+
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-releaseResponse
+		_, _ = w.Write([]byte(`{"task_id":"task-must-be-discarded"}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+	runtime.SetRegistrationClient(server.Client())
+
+	var stalePersisted atomic.Int32
+	var terminalPersisted atomic.Int32
+	runtime.SetTaskPersister(func(_ context.Context, taskID string) error {
+		if taskID == "" {
+			terminalPersisted.Add(1)
+		} else {
+			stalePersisted.Add(1)
+		}
+		return nil
+	})
+	if _, queued := runtime.StartTaskRegistration(); !queued {
+		t.Fatal("missing task was not queued")
+	}
+	<-requestStarted
+	runtime.MarkRuntimeDeleted()
+	close(releaseResponse)
+	coordinator.close()
+
+	status := runtime.RegistrationStatus()
+	if status.State != AgentIdentityRegistrationRuntimeDeleted {
+		t.Fatalf("registration state = %q, want runtime_deleted", status.State)
+	}
+	if runtime.RuntimeSelectionAvailable() {
+		t.Fatal("deleted runtime became selectable after stale registration completed")
+	}
+	if got := stalePersisted.Load(); got != 0 {
+		t.Fatalf("stale persistence calls = %d, want 0", got)
+	}
+	if got := terminalPersisted.Load(); got != 1 {
+		t.Fatalf("terminal persistence calls = %d, want 1", got)
+	}
+}
+
+func TestAgentIdentityRegistrationFailsClosedWhenCredentialsChange(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-credentials-changed", "")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 8, 3, time.Millisecond, 2*time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"task_id":"task-stale"}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+	runtime.SetRegistrationClient(server.Client())
+	runtime.SetTaskPersister(func(context.Context, string) error {
+		return ErrAgentIdentityCredentialsChanged
+	})
+
+	if _, queued := runtime.StartTaskRegistration(); !queued {
+		t.Fatal("missing task was not queued")
+	}
+	status := waitForAgentIdentityRegistrationState(t, runtime, AgentIdentityRegistrationFailed)
+	if status.ErrorCode != "credentials_changed" || status.CanRetry {
+		t.Fatalf("registration status = %+v", status)
+	}
+	if runtime.RuntimeSelectionAvailable() {
+		t.Fatal("runtime became selectable after credentials changed")
+	}
+	if retryStatus, queued := runtime.RetryTaskRegistration(); queued || retryStatus.ErrorCode != "credentials_changed" {
+		t.Fatalf("non-retryable registration queued=%v status=%+v", queued, retryStatus)
+	}
+}
+
+func TestClassifyAgentIdentityRegistrationResponseRetriesRequestTimeout(t *testing.T) {
+	err := normalizeAgentIdentityRegistrationError(classifyAgentIdentityRegistrationResponse(http.StatusRequestTimeout, nil))
+	if !err.retryable || err.code != "http_408" {
+		t.Fatalf("classification = %+v, want retryable http_408", err)
+	}
+}
+
+func waitForAgentIdentityRegistrationState(t *testing.T, runtime *AgentIdentity, want string) AgentIdentityRegistrationStatus {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status := runtime.RegistrationStatus()
+		if status.State == want {
+			return status
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status := runtime.RegistrationStatus()
+	t.Fatalf("registration state = %q, want %q", status.State, want)
+	return status
 }
 
 func TestParseAgentIdentityMetadataVariants(t *testing.T) {
@@ -216,5 +390,14 @@ func TestIsAgentIdentityTaskInvalidResponseIsNarrow(t *testing.T) {
 	}
 	if IsAgentIdentityTaskInvalidResponse(http.StatusUnauthorized, []byte(`{"error":{"code":"invalid_api_key"}}`)) {
 		t.Fatal("unrelated 401 should not trigger task recovery")
+	}
+}
+
+func TestIsAgentIdentityRuntimeDeletedResponseIsNarrow(t *testing.T) {
+	if !IsAgentIdentityRuntimeDeletedResponse(http.StatusBadRequest, []byte(`{"error":{"message":"Agent runtime has been deleted."}}`)) {
+		t.Fatal("deleted runtime message should be terminal")
+	}
+	if IsAgentIdentityRuntimeDeletedResponse(http.StatusServiceUnavailable, []byte(`{"error":{"code":"biscuit_baker_service_agent_error_status","message":"temporary service failure"}}`)) {
+		t.Fatal("generic agent service status must not be classified as a deleted runtime")
 	}
 }

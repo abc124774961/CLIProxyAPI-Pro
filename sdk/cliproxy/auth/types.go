@@ -100,6 +100,14 @@ type Auth struct {
 	indexAssigned  bool              `json:"-"`
 }
 
+// RuntimeAuthView is a minimal read-only projection for callers that only need
+// an auth's identity and in-memory runtime. It intentionally excludes metadata.
+type RuntimeAuthView struct {
+	ID       string `json:"id"`
+	FileName string `json:"file_name"`
+	Runtime  any    `json:"-"`
+}
+
 const (
 	AttributeAuthIndexSeed   = "auth_index_seed"
 	AttributePluginVirtual   = "plugin_virtual"

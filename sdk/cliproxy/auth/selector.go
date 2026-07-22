@@ -43,6 +43,10 @@ const (
 	blockReasonOther
 )
 
+type runtimeSelectionAvailability interface {
+	RuntimeSelectionAvailable() bool
+}
+
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
@@ -306,6 +310,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
+	}
+	if availability, ok := auth.Runtime.(runtimeSelectionAvailability); ok && availability != nil && !availability.RuntimeSelectionAvailable() {
+		return true, blockReasonOther, time.Time{}
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {

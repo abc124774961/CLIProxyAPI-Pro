@@ -20,6 +20,7 @@ const codexAgentIdentityErrorBodyLimit int64 = 64 << 10
 type CodexAgentIdentity interface {
 	Authorization(context.Context, *http.Client) (string, string, error)
 	RecoverAuthorization(context.Context, *http.Client, string) (string, error)
+	MarkRuntimeDeleted()
 	RedactSensitiveBody([]byte) []byte
 }
 
@@ -46,8 +47,9 @@ func CodexAgentIdentityRuntime(auth *cliproxyauth.Auth) (CodexAgentIdentity, boo
 	return runtime, ok && runtime != nil
 }
 
-// DoCodexRequestWithAgentRecovery performs one upstream request and replaces a
-// rejected agent task at most once. Non-agent requests retain their old path.
+// DoCodexRequestWithAgentRecovery performs one upstream request and queues a
+// rejected agent task for background replacement. Non-agent requests retain
+// their old path and the current request can move to another credential.
 func DoCodexRequestWithAgentRecovery(
 	ctx context.Context,
 	auth *cliproxyauth.Auth,
@@ -67,7 +69,7 @@ func DoCodexRequestWithAgentRecovery(
 		return nil, err
 	}
 	runtime, isAgentIdentity := CodexAgentIdentityRuntime(auth)
-	if !isAgentIdentity || resp.StatusCode != http.StatusUnauthorized {
+	if !isAgentIdentity || resp.StatusCode < http.StatusBadRequest {
 		return redactCodexAgentIdentityErrorResponse(runtime, resp), nil
 	}
 
@@ -75,40 +77,21 @@ func DoCodexRequestWithAgentRecovery(
 	if errRead != nil {
 		return nil, errRead
 	}
+	if codexauth.IsAgentIdentityRuntimeDeletedResponse(resp.StatusCode, body) {
+		runtime.MarkRuntimeDeleted()
+		return restoreCodexAgentIdentityErrorResponse(resp, runtime.RedactSensitiveBody(body)), nil
+	}
 	if !codexauth.IsAgentIdentityTaskInvalidResponse(resp.StatusCode, body) {
 		return restoreCodexAgentIdentityErrorResponse(resp, runtime.RedactSensitiveBody(body)), nil
 	}
 	if authClient == nil {
 		return nil, errors.New("codex agent identity HTTP client is nil")
 	}
-	authorization, errRecover := runtime.RecoverAuthorization(ctx, authClient, staleTaskID)
+	_, errRecover := runtime.RecoverAuthorization(ctx, authClient, staleTaskID)
 	if errRecover != nil {
-		return nil, fmt.Errorf("recover codex agent identity task: %w", errRecover)
+		return nil, fmt.Errorf("queue codex agent identity task recovery: %w", errRecover)
 	}
-	retryReq, errClone := cloneCodexRequestForRetry(ctx, req)
-	if errClone != nil {
-		return nil, errClone
-	}
-	retryReq.Header.Set("Authorization", authorization)
-	retryResp, errRetry := upstreamClient.Do(retryReq)
-	if errRetry != nil {
-		return nil, errRetry
-	}
-	return redactCodexAgentIdentityErrorResponse(runtime, retryResp), nil
-}
-
-func cloneCodexRequestForRetry(ctx context.Context, req *http.Request) (*http.Request, error) {
-	if req.GetBody == nil {
-		return nil, errors.New("codex agent identity request body cannot be replayed")
-	}
-	body, err := req.GetBody()
-	if err != nil {
-		return nil, fmt.Errorf("reopen codex request body: %w", err)
-	}
-	retryReq := req.Clone(ctx)
-	retryReq.Body = body
-	retryReq.GetBody = req.GetBody
-	return retryReq, nil
+	return nil, codexauth.ErrAgentIdentityRegistrationPending
 }
 
 func redactCodexAgentIdentityErrorResponse(runtime CodexAgentIdentity, resp *http.Response) *http.Response {

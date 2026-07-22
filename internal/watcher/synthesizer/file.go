@@ -184,7 +184,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if errAgentIdentity := attachAgentIdentityRuntime(a, fullPath); errAgentIdentity != nil {
+	if errAgentIdentity := attachAgentIdentityRuntime(a, fullPath, cfg); errAgentIdentity != nil {
 		return nil
 	}
 	// Read priority from auth file.

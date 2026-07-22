@@ -571,6 +571,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	if runtime, ok := auth.Runtime.(agentIdentityRegistrationRuntime); ok && runtime != nil {
+		entry["agent_identity_registration"] = runtime.RegistrationStatus()
+	}
 	return entry
 }
 

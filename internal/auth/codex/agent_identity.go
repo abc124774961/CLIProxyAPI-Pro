@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -47,10 +48,18 @@ type AgentIdentity struct {
 	encodedPrivateKey string
 	privateKey        ed25519.PrivateKey
 
-	mu      sync.RWMutex
-	taskID  string
-	taskMu  sync.Mutex
-	persist func(context.Context, string) error
+	mu     sync.RWMutex
+	taskID string
+
+	registrationMu          sync.Mutex
+	persist                 func(context.Context, string) error
+	registrationClient      *http.Client
+	registrationCoordinator *agentIdentityRegistrationCoordinator
+	registrationStatus      AgentIdentityRegistrationStatus
+	registrationEnqueued    bool
+	registrationRetryTimer  *time.Timer
+	registrationGeneration  uint64
+	selectionAvailable      atomic.Bool
 }
 
 type agentIdentityTaskRegistrationResponse struct {
@@ -71,12 +80,17 @@ func NewAgentIdentity(credentials AgentIdentityCredentials) (*AgentIdentity, err
 	if err != nil {
 		return nil, err
 	}
-	return &AgentIdentity{
-		runtimeID:         runtimeID,
-		encodedPrivateKey: encodedPrivateKey,
-		privateKey:        privateKey,
-		taskID:            strings.TrimSpace(credentials.TaskID),
-	}, nil
+	taskID := strings.TrimSpace(credentials.TaskID)
+	identity := &AgentIdentity{
+		runtimeID:               runtimeID,
+		encodedPrivateKey:       encodedPrivateKey,
+		privateKey:              privateKey,
+		taskID:                  taskID,
+		registrationCoordinator: defaultAgentIdentityRegistrationCoordinator,
+		registrationStatus:      initialAgentIdentityRegistrationStatus(taskID != ""),
+	}
+	identity.selectionAvailable.Store(taskID != "")
+	return identity, nil
 }
 
 // ValidateAgentIdentityPrivateKey validates an exported key without exposing
@@ -108,9 +122,9 @@ func (a *AgentIdentity) SetTaskPersister(persist func(context.Context, string) e
 	if a == nil {
 		return
 	}
-	a.taskMu.Lock()
+	a.registrationMu.Lock()
 	a.persist = persist
-	a.taskMu.Unlock()
+	a.registrationMu.Unlock()
 }
 
 // Matches reports whether this runtime belongs to the supplied credentials.
@@ -196,7 +210,10 @@ func decryptAgentTaskID(key agentIdentityKey, encoded string) (string, error) {
 
 func registerAgentIdentityTask(ctx context.Context, client *http.Client, key agentIdentityKey) (string, error) {
 	if client == nil {
-		return "", errors.New("agent identity HTTP client is nil")
+		return "", &agentIdentityRegistrationError{
+			code:    "client_unavailable",
+			message: "Task registration client is unavailable.",
+		}
 	}
 	timestamp, signature := signAgentTaskRegistration(key, time.Now())
 	body, err := json.Marshal(map[string]string{
@@ -223,19 +240,44 @@ func registerAgentIdentityTask(ctx context.Context, client *http.Client, key age
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", errors.New("agent task registration request failed")
+		return "", &agentIdentityRegistrationError{
+			code:      "network_error",
+			message:   "Task registration request failed.",
+			retryable: true,
+			cause:     err,
+		}
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.WithError(errClose).Debug("failed to close agent task registration response")
 		}
 	}()
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, agentIdentityRegisterLimit+1))
+	if errRead != nil {
+		return "", &agentIdentityRegistrationError{
+			code:      "response_read_error",
+			message:   "Task registration response could not be read.",
+			retryable: true,
+			cause:     errRead,
+		}
+	}
+	if len(body) > agentIdentityRegisterLimit {
+		return "", &agentIdentityRegistrationError{
+			code:    "response_too_large",
+			message: "Task registration response is too large.",
+		}
+	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("agent task registration returned status %d", resp.StatusCode)
+		return "", classifyAgentIdentityRegistrationResponse(resp.StatusCode, body)
 	}
 	var result agentIdentityTaskRegistrationResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, agentIdentityRegisterLimit)).Decode(&result); err != nil {
-		return "", errors.New("agent task registration response is invalid")
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", &agentIdentityRegistrationError{
+			code:      "invalid_response",
+			message:   "Task registration response is invalid.",
+			retryable: true,
+			cause:     err,
+		}
 	}
 	if taskID := strings.TrimSpace(result.TaskID); taskID != "" {
 		return taskID, nil
@@ -248,44 +290,49 @@ func registerAgentIdentityTask(ctx context.Context, client *http.Client, key age
 		encrypted = strings.TrimSpace(result.EncryptedTaskIDCamel)
 	}
 	if encrypted == "" {
-		return "", errors.New("agent task registration response omitted task id")
+		return "", &agentIdentityRegistrationError{
+			code:      "task_omitted",
+			message:   "Task registration response omitted the task.",
+			retryable: true,
+		}
 	}
 	return decryptAgentTaskID(key, encrypted)
 }
 
-func (a *AgentIdentity) ensureTask(ctx context.Context, client *http.Client, expectedStaleTaskID string) error {
-	if a == nil {
-		return errors.New("agent identity is nil")
-	}
-	a.taskMu.Lock()
-	defer a.taskMu.Unlock()
-
-	key := a.key()
-	if key.taskID != "" && (expectedStaleTaskID == "" || key.taskID != expectedStaleTaskID) {
-		return nil
-	}
-	newTaskID, err := registerAgentIdentityTask(ctx, client, key)
-	if err != nil {
-		return err
-	}
-	if a.persist != nil {
-		if err := a.persist(ctx, newTaskID); err != nil {
-			log.WithError(err).Warn("failed to persist agent identity task; continuing with in-memory task")
+func classifyAgentIdentityRegistrationResponse(statusCode int, body []byte) error {
+	if IsAgentIdentityRuntimeDeletedResponse(statusCode, body) {
+		return &agentIdentityRegistrationError{
+			code:    "runtime_deleted",
+			message: "Agent runtime has been deleted. Import fresh credentials to recover this account.",
 		}
 	}
-	a.mu.Lock()
-	a.taskID = newTaskID
-	a.mu.Unlock()
-	return nil
+	if statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError {
+		return &agentIdentityRegistrationError{
+			code:      fmt.Sprintf("http_%d", statusCode),
+			message:   "Task registration service is temporarily unavailable.",
+			retryable: true,
+		}
+	}
+	return &agentIdentityRegistrationError{
+		code:    fmt.Sprintf("http_%d", statusCode),
+		message: "Task registration was rejected.",
+	}
 }
 
 // Authorization returns a fresh AgentAssertion and the task used to build it.
 // The task value is only for one-time stale-task recovery and must not be logged.
 func (a *AgentIdentity) Authorization(ctx context.Context, client *http.Client) (headerValue, taskID string, err error) {
-	if err := a.ensureTask(ctx, client, ""); err != nil {
-		return "", "", err
+	if a == nil {
+		return "", "", errors.New("agent identity is nil")
 	}
 	key := a.key()
+	if key.taskID == "" {
+		status, _ := a.QueueTaskRegistration(client, "")
+		if status.State == AgentIdentityRegistrationRuntimeDeleted {
+			return "", "", ErrAgentIdentityRuntimeDeleted
+		}
+		return "", "", ErrAgentIdentityRegistrationPending
+	}
 	assertion, err := buildAgentAssertion(key, time.Now())
 	if err != nil {
 		return "", "", err
@@ -293,14 +340,14 @@ func (a *AgentIdentity) Authorization(ctx context.Context, client *http.Client) 
 	return assertion, key.taskID, nil
 }
 
-// RecoverAuthorization replaces an explicitly rejected task and returns one
-// fresh assertion. Concurrent recoveries collapse into one registration.
+// RecoverAuthorization queues an explicitly rejected task for replacement.
+// Concurrent recoveries collapse into one background registration.
 func (a *AgentIdentity) RecoverAuthorization(ctx context.Context, client *http.Client, staleTaskID string) (string, error) {
-	if err := a.ensureTask(ctx, client, strings.TrimSpace(staleTaskID)); err != nil {
-		return "", err
+	status, _ := a.QueueTaskRegistration(client, strings.TrimSpace(staleTaskID))
+	if status.State == AgentIdentityRegistrationRuntimeDeleted {
+		return "", ErrAgentIdentityRuntimeDeleted
 	}
-	key := a.key()
-	return buildAgentAssertion(key, time.Now())
+	return "", ErrAgentIdentityRegistrationPending
 }
 
 // IsAgentIdentityTaskInvalidResponse recognizes only errors that safely allow
@@ -330,6 +377,17 @@ func IsAgentIdentityTaskInvalidResponse(statusCode int, body []byte) bool {
 		}
 	}
 	return false
+}
+
+// IsAgentIdentityRuntimeDeletedResponse recognizes the terminal Agent Identity
+// response without exposing its credential-bearing payload.
+func IsAgentIdentityRuntimeDeletedResponse(_ int, body []byte) bool {
+	lower := strings.ToLower(string(body))
+	compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(lower)
+	return strings.Contains(lower, "agent runtime has been deleted") ||
+		strings.Contains(lower, "agent_runtime has been deleted") ||
+		(strings.Contains(compact, "biscuit_baker_service_agent_error_status") &&
+			strings.Contains(compact, "runtime_deleted"))
 }
 
 // RedactSensitiveBody removes credential values if an upstream error echoes

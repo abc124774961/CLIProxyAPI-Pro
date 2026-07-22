@@ -4704,6 +4704,28 @@ func (m *Manager) List() []*Auth {
 	return list
 }
 
+// ListRuntimeViews returns lightweight runtime projections without cloning
+// credential metadata, attributes, model state, or counters.
+func (m *Manager) ListRuntimeViews() []RuntimeAuthView {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	views := make([]RuntimeAuthView, 0, len(m.auths))
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		views = append(views, RuntimeAuthView{
+			ID:       auth.ID,
+			FileName: auth.FileName,
+			Runtime:  auth.Runtime,
+		})
+	}
+	return views
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {

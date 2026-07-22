@@ -1,20 +1,46 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+type managementTestAgentRegistrationRuntime struct {
+	status  codexauth.AgentIdentityRegistrationStatus
+	retries int
+}
+
+func (r *managementTestAgentRegistrationRuntime) SetRegistrationClient(*http.Client) {}
+
+func (r *managementTestAgentRegistrationRuntime) RegistrationStatus() codexauth.AgentIdentityRegistrationStatus {
+	return r.status
+}
+
+func (r *managementTestAgentRegistrationRuntime) RetryTaskRegistration() (codexauth.AgentIdentityRegistrationStatus, bool) {
+	r.retries++
+	r.status = codexauth.AgentIdentityRegistrationStatus{
+		State:  codexauth.AgentIdentityRegistrationQueued,
+		Active: true,
+	}
+	return r.status, true
+}
 
 func managementTestAgentIdentityKey(t *testing.T) string {
 	t.Helper()
@@ -74,5 +100,117 @@ func TestWriteAuthFileExpandsAgentIdentityBundle(t *testing.T) {
 		if len(auths) != 1 || auths[0].Runtime == nil {
 			t.Fatalf("generated file %q is not a runnable auth", entry.Name())
 		}
+	}
+}
+
+func TestListAuthFilesIncludesAgentIdentityRegistration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "agent.json")
+	if err := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runtime := &managementTestAgentRegistrationRuntime{status: codexauth.AgentIdentityRegistrationStatus{
+		State:     codexauth.AgentIdentityRegistrationRuntimeDeleted,
+		ErrorCode: "runtime_deleted",
+		Error:     "Agent runtime has been deleted.",
+	}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	_, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "agent.json",
+		FileName: "agent.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": path,
+		},
+		Runtime: runtime,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	handler.ListAuthFiles(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"state":"runtime_deleted"`) ||
+		strings.Contains(recorder.Body.String(), "runtime-secret") {
+		t.Fatalf("unexpected response: %s", recorder.Body.String())
+	}
+}
+
+func TestRegisterAgentIdentityTaskQueuesRetry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtime := &managementTestAgentRegistrationRuntime{status: codexauth.AgentIdentityRegistrationStatus{
+		State:    codexauth.AgentIdentityRegistrationFailed,
+		CanRetry: true,
+	}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	_, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "agent.json",
+		FileName: "agent.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Runtime:  runtime,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/auth-files/agent-identity/register",
+		bytes.NewBufferString(`{"name":"agent.json"}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.RegisterAgentIdentityTask(ctx)
+
+	if recorder.Code != http.StatusAccepted || runtime.retries != 1 {
+		t.Fatalf("status=%d retries=%d body=%s", recorder.Code, runtime.retries, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"state":"queued"`) {
+		t.Fatalf("unexpected response: %s", recorder.Body.String())
+	}
+}
+
+func TestListAgentIdentityRegistrationsReturnsLightweightProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtime := &managementTestAgentRegistrationRuntime{status: codexauth.AgentIdentityRegistrationStatus{
+		State:  codexauth.AgentIdentityRegistrationRegistering,
+		Active: true,
+	}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	_, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "agent.json",
+		FileName: "agent.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Runtime:  runtime,
+		Metadata: map[string]any{"agent_private_key": "must-not-leak"},
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/agent-identity/registrations", nil)
+
+	handler.ListAgentIdentityRegistrations(ctx)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"active":1`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "must-not-leak") {
+		t.Fatalf("registration progress leaked auth metadata: %s", recorder.Body.String())
 	}
 }

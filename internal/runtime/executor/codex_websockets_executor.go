@@ -1797,10 +1797,17 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithAgentRecovery(
 		return conn, resp, nil
 	}
 	runtime, isAgentIdentity := helps.CodexAgentIdentityRuntime(auth)
-	if !isAgentIdentity || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+	if !isAgentIdentity || resp == nil {
 		return conn, resp, errDial
 	}
 	body := websocketHandshakeBody(resp)
+	if codexauth.IsAgentIdentityRuntimeDeletedResponse(resp.StatusCode, body) {
+		runtime.MarkRuntimeDeleted()
+		return conn, restoreWebsocketHandshakeBody(resp, runtime.RedactSensitiveBody(body)), errDial
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return conn, restoreWebsocketHandshakeBody(resp, runtime.RedactSensitiveBody(body)), errDial
+	}
 	if !codexauth.IsAgentIdentityTaskInvalidResponse(resp.StatusCode, body) {
 		return conn, restoreWebsocketHandshakeBody(resp, runtime.RedactSensitiveBody(body)), errDial
 	}
