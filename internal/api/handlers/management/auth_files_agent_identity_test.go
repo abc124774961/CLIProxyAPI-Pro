@@ -268,6 +268,149 @@ func TestWriteAuthFileBundleReusesPendingRecoveryFile(t *testing.T) {
 	}
 }
 
+func TestWriteAuthFileBundleReplacesChangedRuntimeByUserIdentity(t *testing.T) {
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	handler := &Handler{
+		cfg:         &config.Config{AuthDir: authDir},
+		authManager: manager,
+	}
+	oldKey := managementTestAgentIdentityKey(t)
+	oldBundle, err := json.Marshal(map[string]any{
+		"accounts": []map[string]any{{
+			"name": "member@example.com",
+			"credentials": map[string]any{
+				"auth_mode":          "agentIdentity",
+				"account_id":         "shared-team",
+				"chatgpt_account_id": "shared-team",
+				"chatgpt_user_id":    "member-user",
+				"email":              "member@example.com",
+				"agent_runtime_id":   "runtime-old",
+				"agent_private_key":  oldKey,
+				"task_id":            "task-old",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal old bundle: %v", err)
+	}
+	if err := handler.writeAuthFile(context.Background(), "old.json", oldBundle); err != nil {
+		t.Fatalf("write old bundle: %v", err)
+	}
+	entries, err := os.ReadDir(authDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("old bundle files=%d err=%v", len(entries), err)
+	}
+	originalName := entries[0].Name()
+
+	newKey := managementTestAgentIdentityKey(t)
+	newBundle, err := json.Marshal(map[string]any{
+		"accounts": []map[string]any{{
+			"name": "member@example.com",
+			"credentials": map[string]any{
+				"auth_mode":          "agentIdentity",
+				"account_id":         "shared-team",
+				"chatgpt_account_id": "shared-team",
+				"chatgpt_user_id":    "member-user",
+				"email":              "member@example.com",
+				"agent_runtime_id":   "runtime-new",
+				"agent_private_key":  newKey,
+				"task_id":            "task-new",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal new bundle: %v", err)
+	}
+	if err := handler.writeAuthFile(context.Background(), "new.json", newBundle); err != nil {
+		t.Fatalf("write new bundle: %v", err)
+	}
+	entries, err = os.ReadDir(authDir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != originalName {
+		t.Fatalf("updated bundle files=%v err=%v", entries, err)
+	}
+	persisted, err := os.ReadFile(filepath.Join(authDir, originalName))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Contains(persisted, []byte("runtime-new")) ||
+		!bytes.Contains(persisted, []byte("task-new")) ||
+		bytes.Contains(persisted, []byte("runtime-old")) {
+		t.Fatal("changed runtime was not replaced in place")
+	}
+}
+
+func TestWriteAuthFileBundleDoesNotMergeSharedTeamMembers(t *testing.T) {
+	authDir := t.TempDir()
+	handler := &Handler{cfg: &config.Config{AuthDir: authDir}}
+	key := managementTestAgentIdentityKey(t)
+	writeMember := func(name, userID, runtimeID string) {
+		t.Helper()
+		bundle, err := json.Marshal(map[string]any{
+			"accounts": []map[string]any{{
+				"name": name,
+				"credentials": map[string]any{
+					"auth_mode":          "agentIdentity",
+					"account_id":         "shared-team",
+					"chatgpt_account_id": "shared-team",
+					"chatgpt_user_id":    userID,
+					"email":              name,
+					"agent_runtime_id":   runtimeID,
+					"agent_private_key":  key,
+					"task_id":            "task-" + runtimeID,
+				},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("Marshal member: %v", err)
+		}
+		if err := handler.writeAuthFile(context.Background(), name+".json", bundle); err != nil {
+			t.Fatalf("write member: %v", err)
+		}
+	}
+
+	writeMember("first@example.com", "user-first", "runtime-first")
+	writeMember("second@example.com", "user-second", "runtime-second")
+	entries, err := os.ReadDir(authDir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("shared team files=%d err=%v", len(entries), err)
+	}
+}
+
+func TestPendingAgentIdentityCannotInheritAnotherTeamMemberCredentials(t *testing.T) {
+	authDir := t.TempDir()
+	handler := &Handler{cfg: &config.Config{AuthDir: authDir}}
+	key := managementTestAgentIdentityKey(t)
+	healthyPayload, err := json.Marshal(map[string]any{
+		"type":               "codex",
+		"auth_mode":          "agentIdentity",
+		"account_id":         "shared-team",
+		"chatgpt_account_id": "shared-team",
+		"chatgpt_user_id":    "user-first",
+		"email":              "first@example.com",
+		"agent_runtime_id":   "runtime-first",
+		"agent_private_key":  key,
+		"task_id":            "task-first",
+	})
+	if err != nil {
+		t.Fatalf("Marshal healthy payload: %v", err)
+	}
+	if err := handler.writeAuthFile(context.Background(), "shared.json", healthyPayload); err != nil {
+		t.Fatalf("write healthy payload: %v", err)
+	}
+	pendingPayload := []byte(`{"type":"codex","auth_mode":"agentIdentity","account_id":"shared-team","chatgpt_account_id":"shared-team","chatgpt_user_id":"user-second","email":"second@example.com"}`)
+	if err := handler.writeAuthFile(context.Background(), "shared.json", pendingPayload); err != nil {
+		t.Fatalf("write pending payload: %v", err)
+	}
+	persisted, err := os.ReadFile(filepath.Join(authDir, "shared.json"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if bytes.Contains(persisted, []byte("runtime-first")) || bytes.Contains(persisted, []byte("task-first")) {
+		t.Fatal("pending account inherited another team member's signing credentials")
+	}
+}
+
 func TestListAuthFilesIncludesAgentIdentityRegistration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	authDir := t.TempDir()

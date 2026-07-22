@@ -3,6 +3,7 @@ package codex
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -138,5 +139,41 @@ func TestParseAgentIdentityBundleIgnoresSub2OAuthBundle(t *testing.T) {
 	files, handled, err := ParseAgentIdentityBundle(payload)
 	if err != nil || handled || len(files) != 0 {
 		t.Fatalf("files=%d handled=%v err=%v", len(files), handled, err)
+	}
+}
+
+func TestParseAgentIdentityBundleKeepsSharedTeamMembersSeparate(t *testing.T) {
+	_, _, encoded := newTestAgentIdentity(t, "unused", "unused")
+	accounts := make([]map[string]any, 0, 499)
+	for index := 0; index < 499; index++ {
+		accounts = append(accounts, map[string]any{
+			"name": fmt.Sprintf("member-%03d", index),
+			"credentials": map[string]any{
+				"auth_mode":          "agentIdentity",
+				"account_id":         "shared-team",
+				"chatgpt_account_id": "shared-team",
+				"chatgpt_user_id":    fmt.Sprintf("user-%03d", index),
+				"email":              fmt.Sprintf("member-%03d@example.com", index),
+				"agent_runtime_id":   fmt.Sprintf("runtime-%03d", index),
+				"agent_private_key":  encoded,
+				"task_id":            fmt.Sprintf("task-%03d", index),
+			},
+		})
+	}
+	payload, err := json.Marshal(map[string]any{"accounts": accounts})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	files, handled, err := ParseAgentIdentityBundle(payload)
+	if err != nil || !handled || len(files) != len(accounts) {
+		t.Fatalf("files=%d handled=%v err=%v", len(files), handled, err)
+	}
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if _, duplicate := seen[file.FileName]; duplicate {
+			t.Fatalf("duplicate file name %q", file.FileName)
+		}
+		seen[file.FileName] = struct{}{}
 	}
 }

@@ -174,18 +174,27 @@ func isUnsafeAgentIdentityIDToken(value any) bool {
 }
 
 func agentIdentityBundleStableIdentity(account agentIdentityBundleAccount, index int, credentials AgentIdentityCredentials) string {
+	nested := firstMap(account.Credentials, "agent_identity", "agentIdentity")
 	if runtimeID := strings.TrimSpace(credentials.RuntimeID); runtimeID != "" {
 		return "runtime:" + runtimeID
 	}
+	if userID := firstNonEmpty(
+		firstString(account.Credentials, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"),
+		firstString(nested, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"),
+		firstString(account.Extra, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"),
+	); userID != "" {
+		return "user:" + userID
+	}
 	if email := firstNonEmpty(
 		firstString(account.Credentials, "email"),
+		firstString(nested, "email"),
 		firstString(account.Extra, "email"),
-		strings.TrimSpace(account.Name),
 	); email != "" {
 		return "email:" + strings.ToLower(email)
 	}
 	if accountID := firstNonEmpty(
 		firstString(account.Credentials, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"),
+		firstString(nested, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"),
 		firstString(account.Extra, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"),
 	); accountID != "" {
 		return "account:" + accountID

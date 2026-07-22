@@ -1014,15 +1014,8 @@ func (h *Handler) writeAuthFileWithDefaults(
 			}
 			canonical = append(canonical, '\n')
 			name := item.FileName
-			for _, identity := range agentIdentityAccountLookupKeys(item.Metadata) {
-				if existingName := existingNames[identity]; existingName != "" {
-					name = existingName
-					delete(existingNames, identity)
-					break
-				}
-			}
-			if identity := agentIdentityAccountKey(item.Metadata); identity != "" {
-				existingNames[identity] = name
+			if existingName := existingNames.claim(item.Metadata); existingName != "" {
+				name = existingName
 			}
 			if errWrite := h.writeSingleAuthFile(ctx, name, canonical); errWrite != nil {
 				return errWrite
@@ -1057,14 +1050,68 @@ func (h *Handler) writeAuthFileWithDefaults(
 	return h.writeSingleAuthFile(ctx, name, dataWithDefaults)
 }
 
-func (h *Handler) existingAgentIdentityImportNames() map[string]string {
-	names := make(map[string]string)
+type agentIdentityImportNameIndex struct {
+	names     map[string]string
+	ambiguous map[string]struct{}
+	claimed   map[string]struct{}
+}
+
+func newAgentIdentityImportNameIndex() *agentIdentityImportNameIndex {
+	return &agentIdentityImportNameIndex{
+		names:     make(map[string]string),
+		ambiguous: make(map[string]struct{}),
+		claimed:   make(map[string]struct{}),
+	}
+}
+
+func (i *agentIdentityImportNameIndex) add(name string, metadata map[string]any) {
+	if i == nil || name == "" {
+		return
+	}
+	for _, identity := range agentIdentityAccountLookupKeys(metadata) {
+		if _, ambiguous := i.ambiguous[identity]; ambiguous {
+			continue
+		}
+		if existingName, exists := i.names[identity]; exists && existingName != name {
+			delete(i.names, identity)
+			i.ambiguous[identity] = struct{}{}
+			continue
+		}
+		i.names[identity] = name
+	}
+}
+
+// claim returns one unambiguous existing auth file and prevents a second
+// account in the same bundle from overwriting that file.
+func (i *agentIdentityImportNameIndex) claim(metadata map[string]any) string {
+	if i == nil {
+		return ""
+	}
+	for _, identity := range agentIdentityAccountLookupKeys(metadata) {
+		if _, ambiguous := i.ambiguous[identity]; ambiguous {
+			continue
+		}
+		name := i.names[identity]
+		if name == "" {
+			continue
+		}
+		if _, claimed := i.claimed[name]; claimed {
+			continue
+		}
+		i.claimed[name] = struct{}{}
+		return name
+	}
+	return ""
+}
+
+func (h *Handler) existingAgentIdentityImportNames() *agentIdentityImportNameIndex {
+	index := newAgentIdentityImportNameIndex()
 	if h == nil || h.cfg == nil {
-		return names
+		return index
 	}
 	entries, errReadDir := os.ReadDir(h.cfg.AuthDir)
 	if errReadDir != nil {
-		return names
+		return index
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
@@ -1081,23 +1128,9 @@ func (h *Handler) existingAgentIdentityImportNames() map[string]string {
 		if _, handled, _ := codex.ParseAgentIdentityMetadata(metadata); !handled {
 			continue
 		}
-		identity := agentIdentityAccountKey(metadata)
-		if identity == "" {
-			continue
-		}
-		if _, exists := names[identity]; !exists {
-			names[identity] = entry.Name()
-		}
+		index.add(entry.Name(), metadata)
 	}
-	return names
-}
-
-func agentIdentityAccountKey(metadata map[string]any) string {
-	keys := agentIdentityAccountLookupKeys(metadata)
-	if len(keys) == 0 {
-		return ""
-	}
-	return keys[0]
+	return index
 }
 
 func agentIdentityAccountLookupKeys(metadata map[string]any) []string {
@@ -1106,11 +1139,18 @@ func agentIdentityAccountLookupKeys(metadata map[string]any) []string {
 	if handled && credentials.RuntimeID != "" {
 		keys = append(keys, "runtime:"+credentials.RuntimeID)
 	}
-	if email := authMetadataString(metadata, "email", "name"); email != "" {
+	if userID := agentIdentityMetadataString(metadata, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"); userID != "" {
+		keys = append(keys, "user:"+userID)
+	}
+	if email := agentIdentityMetadataString(metadata, "email"); email != "" {
 		keys = append(keys, "email:"+strings.ToLower(email))
 	}
-	if accountID := authMetadataString(metadata, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"); accountID != "" {
-		keys = append(keys, "account:"+accountID)
+	// A Team/workspace account id may be shared by many users. It is only a
+	// safe fallback when the record has no runtime, user id, or email.
+	if len(keys) == 0 {
+		if accountID := agentIdentityMetadataString(metadata, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId"); accountID != "" {
+			keys = append(keys, "account:"+accountID)
+		}
 	}
 	return keys
 }
@@ -1236,14 +1276,35 @@ func sameAgentIdentityAccount(
 	if incomingCredentials.RuntimeID != "" && existingCredentials.RuntimeID != "" {
 		return incomingCredentials.RuntimeID == existingCredentials.RuntimeID
 	}
-	incomingAccountID := authMetadataString(incoming, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId")
-	existingAccountID := authMetadataString(existing, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId")
-	if incomingAccountID != "" && existingAccountID != "" {
-		return incomingAccountID == existingAccountID
+	incomingUserID := agentIdentityMetadataString(incoming, "chatgpt_user_id", "chatgptUserId", "user_id", "userId")
+	existingUserID := agentIdentityMetadataString(existing, "chatgpt_user_id", "chatgptUserId", "user_id", "userId")
+	if incomingUserID != "" && existingUserID != "" {
+		return incomingUserID == existingUserID
 	}
-	incomingEmail := authMetadataString(incoming, "email")
-	existingEmail := authMetadataString(existing, "email")
-	return incomingEmail != "" && existingEmail != "" && strings.EqualFold(incomingEmail, existingEmail)
+	incomingEmail := agentIdentityMetadataString(incoming, "email")
+	existingEmail := agentIdentityMetadataString(existing, "email")
+	if incomingEmail != "" && existingEmail != "" {
+		return strings.EqualFold(incomingEmail, existingEmail)
+	}
+	if incomingUserID != "" || existingUserID != "" || incomingEmail != "" || existingEmail != "" {
+		return false
+	}
+	incomingAccountID := agentIdentityMetadataString(incoming, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId")
+	existingAccountID := agentIdentityMetadataString(existing, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId", "workspace_id", "workspaceId")
+	return incomingAccountID != "" && existingAccountID != "" && incomingAccountID == existingAccountID
+}
+
+func agentIdentityMetadataString(metadata map[string]any, keys ...string) string {
+	if value := authMetadataString(metadata, keys...); value != "" {
+		return value
+	}
+	for _, container := range []string{"agent_identity", "agentIdentity"} {
+		nested, _ := metadata[container].(map[string]any)
+		if value := authMetadataString(nested, keys...); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func authMetadataString(metadata map[string]any, keys ...string) string {
