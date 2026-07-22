@@ -342,6 +342,9 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 	if hasUnauthorizedAuthFailure(auth) {
 		return time.Time{}, false
 	}
+	if isAgentIdentityAuth(auth) {
+		return time.Time{}, false
+	}
 
 	if auth.AuthKind() == AuthKindAPIKey {
 		return time.Time{}, false
@@ -411,6 +414,45 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return dueAt, true
 	}
 	return now, true
+}
+
+func isAgentIdentityAuth(auth *Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	if metadataStringEqualFold(auth.Metadata, "agentIdentity", "auth_mode", "authMode") {
+		return true
+	}
+	if metadataHasNonEmptyString(auth.Metadata, "agent_runtime_id", "agentRuntimeId", "agent_private_key", "agentPrivateKey") {
+		return true
+	}
+	for _, key := range []string{"agent_identity", "agentIdentity"} {
+		nested, _ := auth.Metadata[key].(map[string]any)
+		if metadataHasNonEmptyString(nested, "agent_runtime_id", "agentRuntimeId", "agent_private_key", "agentPrivateKey") {
+			return true
+		}
+	}
+	return false
+}
+
+func metadataStringEqualFold(metadata map[string]any, expected string, keys ...string) bool {
+	for _, key := range keys {
+		value, _ := metadata[key].(string)
+		if strings.EqualFold(strings.TrimSpace(value), expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func metadataHasNonEmptyString(metadata map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		value, _ := metadata[key].(string)
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 type refreshHeapItem struct {

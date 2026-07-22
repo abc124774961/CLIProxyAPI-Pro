@@ -2203,6 +2203,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
 	}
+	if shouldPreserveRuntimeOnUpdate(ctx) && auth.Runtime == nil {
+		auth.Runtime = existing.Runtime
+	}
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
@@ -5921,6 +5924,12 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if hasUnauthorizedAuthFailure(a) {
 		return false
 	}
+	// Agent Identity credentials use signed task registration rather than the
+	// OAuth refresh flow. During startup the file watcher may not have attached
+	// their runtime yet, so metadata must also suppress OAuth auto-refresh.
+	if isAgentIdentityAuth(a) {
+		return false
+	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
@@ -6299,7 +6308,10 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	saved, errUpdate := m.Update(ctx, updated)
+	// A watcher update can install a provider runtime while Refresh is in
+	// flight. Preserve that current runtime atomically inside Update instead of
+	// committing the nil runtime from this older refresh snapshot.
+	saved, errUpdate := m.Update(withPreservedRuntimeOnUpdate(ctx), updated)
 	for _, model := range modelsToResume {
 		registry.GetGlobalRegistry().ResumeClientModel(id, model)
 	}
