@@ -411,6 +411,7 @@ func IsAgentIdentityRuntimeDeletedResponse(_ int, body []byte) bool {
 	compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(lower)
 	return strings.Contains(lower, "agent runtime has been deleted") ||
 		strings.Contains(lower, "agent_runtime has been deleted") ||
+		strings.Contains(compact, `"code":"deleted_agent_runtime_id"`) ||
 		(strings.Contains(compact, "biscuit_baker_service_agent_error_status") &&
 			strings.Contains(compact, "runtime_deleted"))
 }

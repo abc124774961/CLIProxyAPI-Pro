@@ -531,6 +531,9 @@ func TestIsAgentIdentityRuntimeDeletedResponseIsNarrow(t *testing.T) {
 	if !IsAgentIdentityRuntimeDeletedResponse(http.StatusBadRequest, []byte(`{"error":{"message":"Agent runtime has been deleted."}}`)) {
 		t.Fatal("deleted runtime message should be terminal")
 	}
+	if !IsAgentIdentityRuntimeDeletedResponse(http.StatusForbidden, []byte(`{"error":{"code":"deleted_agent_runtime_id","message":"Invalid task registration request."}}`)) {
+		t.Fatal("deleted_agent_runtime_id should be terminal")
+	}
 	if IsAgentIdentityRuntimeDeletedResponse(http.StatusServiceUnavailable, []byte(`{"error":{"code":"biscuit_baker_service_agent_error_status","message":"temporary service failure"}}`)) {
 		t.Fatal("generic agent service status must not be classified as a deleted runtime")
 	}
