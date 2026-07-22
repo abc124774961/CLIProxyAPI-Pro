@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -142,9 +143,14 @@ func TestAgentIdentityConcurrentRegistrationIsSingleFlight(t *testing.T) {
 	agentIdentityAuthAPIBaseURLForTest = server.URL
 	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
 
-	var persisted atomic.Int32
-	runtime.SetTaskPersister(func(context.Context, string) error {
-		persisted.Add(1)
+	var taskPersisted atomic.Int32
+	var queuedPersisted atomic.Int32
+	runtime.SetTaskPersister(func(_ context.Context, taskID, state string) error {
+		if taskID != "" && state == AgentIdentityRegistrationReady {
+			taskPersisted.Add(1)
+		} else if taskID == "" && state == AgentIdentityRegistrationQueued {
+			queuedPersisted.Add(1)
+		}
 		return nil
 	})
 	runtime.SetRegistrationClient(server.Client())
@@ -169,11 +175,125 @@ func TestAgentIdentityConcurrentRegistrationIsSingleFlight(t *testing.T) {
 	if got := registrations.Load(); got != 1 {
 		t.Fatalf("registrations = %d, want 1", got)
 	}
-	if got := persisted.Load(); got != 1 {
-		t.Fatalf("persistence calls = %d, want 1", got)
+	if got := taskPersisted.Load(); got != 1 {
+		t.Fatalf("task persistence calls = %d, want 1", got)
+	}
+	if got := queuedPersisted.Load(); got != 1 {
+		t.Fatalf("queued persistence calls = %d, want 1", got)
 	}
 	if _, taskID, err := runtime.Authorization(context.Background(), server.Client()); err != nil || taskID != "task-shared" {
 		t.Fatalf("Authorization after registration task=%q err=%v", taskID, err)
+	}
+}
+
+func TestAgentIdentityConcurrentRecoveryWaitsForSharedRegistration(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-concurrent-recovery", "task-stale")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 32, 1, time.Millisecond, time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
+
+	var registrations atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		registrations.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"task_id":"task-recovered"}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+
+	const callers = 20
+	start := make(chan struct{})
+	errorsFound := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			assertion, errRecover := runtime.RecoverAuthorization(context.Background(), server.Client(), "task-stale")
+			if errRecover == nil && !strings.HasPrefix(assertion, "AgentAssertion ") {
+				errRecover = fmt.Errorf("unexpected assertion scheme")
+			}
+			errorsFound <- errRecover
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errorsFound)
+	for errRecover := range errorsFound {
+		if errRecover != nil {
+			t.Fatalf("RecoverAuthorization: %v", errRecover)
+		}
+	}
+	if got := registrations.Load(); got != 1 {
+		t.Fatalf("registrations = %d, want 1", got)
+	}
+	if taskID := runtime.key().taskID; taskID != "task-recovered" {
+		t.Fatalf("recovered task = %q", taskID)
+	}
+}
+
+func TestAgentIdentityAuthorizationCancellationDoesNotCancelSharedRecovery(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-cancelled-waiter", "")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 8, 1, time.Millisecond, time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
+
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestStarted)
+		<-releaseResponse
+		_, _ = w.Write([]byte(`{"task_id":"task-after-cancel"}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, _, errAuthorization := runtime.Authorization(ctx, server.Client())
+		result <- errAuthorization
+	}()
+	<-requestStarted
+	if errAuthorization := <-result; !errors.Is(errAuthorization, context.DeadlineExceeded) {
+		close(releaseResponse)
+		t.Fatalf("Authorization error = %v, want deadline exceeded", errAuthorization)
+	}
+	close(releaseResponse)
+	waitForAgentIdentityRegistrationState(t, runtime, AgentIdentityRegistrationReady)
+	if taskID := runtime.key().taskID; taskID != "task-after-cancel" {
+		t.Fatalf("recovered task = %q", taskID)
+	}
+}
+
+func TestAgentIdentityRecoveryFailureDoesNotReturnAssertion(t *testing.T) {
+	runtime, _, _ := newTestAgentIdentity(t, "runtime-recovery-failure", "task-stale")
+	coordinator := newAgentIdentityRegistrationCoordinator(1, 8, 1, time.Millisecond, time.Millisecond)
+	defer coordinator.close()
+	runtime.registrationCoordinator = coordinator
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"registration_rejected"}}`))
+	}))
+	defer server.Close()
+	previousBaseURL := agentIdentityAuthAPIBaseURLForTest
+	agentIdentityAuthAPIBaseURLForTest = server.URL
+	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
+
+	assertion, errRecover := runtime.RecoverAuthorization(context.Background(), server.Client(), "task-stale")
+	if errRecover == nil || assertion != "" {
+		t.Fatalf("assertion=%q error=%v, want failed recovery without assertion", assertion, errRecover)
+	}
+	status := runtime.RegistrationStatus()
+	if status.State != AgentIdentityRegistrationFailed || status.Attempts != 1 {
+		t.Fatalf("registration status = %+v", status)
 	}
 }
 
@@ -257,10 +377,10 @@ func TestAgentIdentityRuntimeDeletedWinsOverInFlightRegistration(t *testing.T) {
 
 	var stalePersisted atomic.Int32
 	var terminalPersisted atomic.Int32
-	runtime.SetTaskPersister(func(_ context.Context, taskID string) error {
-		if taskID == "" {
+	runtime.SetTaskPersister(func(_ context.Context, taskID, state string) error {
+		if taskID == "" && state == AgentIdentityRegistrationRuntimeDeleted {
 			terminalPersisted.Add(1)
-		} else {
+		} else if taskID != "" {
 			stalePersisted.Add(1)
 		}
 		return nil
@@ -302,7 +422,7 @@ func TestAgentIdentityRegistrationFailsClosedWhenCredentialsChange(t *testing.T)
 	agentIdentityAuthAPIBaseURLForTest = server.URL
 	defer func() { agentIdentityAuthAPIBaseURLForTest = previousBaseURL }()
 	runtime.SetRegistrationClient(server.Client())
-	runtime.SetTaskPersister(func(context.Context, string) error {
+	runtime.SetTaskPersister(func(context.Context, string, string) error {
 		return ErrAgentIdentityCredentialsChanged
 	})
 
@@ -370,6 +490,20 @@ func TestParseAgentIdentityMetadataVariants(t *testing.T) {
 				t.Fatalf("unexpected credentials fields")
 			}
 		})
+	}
+}
+
+func TestParseAgentIdentityMetadataMarksMissingCredentialsRecoverable(t *testing.T) {
+	credentials, handled, err := ParseAgentIdentityMetadata(map[string]any{
+		"auth_mode":  "agentIdentity",
+		"account_id": "account-placeholder",
+		"email":      "pending@example.com",
+	})
+	if !handled || !errors.Is(err, ErrAgentIdentityCredentialsMissing) {
+		t.Fatalf("ParseAgentIdentityMetadata() handled=%v err=%v", handled, err)
+	}
+	if credentials.RuntimeID != "" || credentials.PrivateKey != "" {
+		t.Fatalf("unexpected synthesized credentials: %+v", credentials)
 	}
 }
 

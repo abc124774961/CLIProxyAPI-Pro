@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,18 +12,21 @@ import (
 )
 
 const (
-	AgentIdentityRegistrationReady          = "ready"
-	AgentIdentityRegistrationQueued         = "queued"
-	AgentIdentityRegistrationRegistering    = "registering"
-	AgentIdentityRegistrationRetryWait      = "retry_wait"
-	AgentIdentityRegistrationRuntimeDeleted = "runtime_deleted"
-	AgentIdentityRegistrationFailed         = "failed"
+	AgentIdentityRegistrationReady              = "ready"
+	AgentIdentityRegistrationCredentialsPending = "credentials_pending"
+	AgentIdentityRegistrationQueued             = "queued"
+	AgentIdentityRegistrationRegistering        = "registering"
+	AgentIdentityRegistrationRetryWait          = "retry_wait"
+	AgentIdentityRegistrationRuntimeDeleted     = "runtime_deleted"
+	AgentIdentityRegistrationFailed             = "failed"
 )
 
 const (
-	agentIdentityRegistrationWorkers     = 4
+	agentIdentityRegistrationWorkers     = 6
+	agentIdentityRegistrationMaxWorkers  = 64
 	agentIdentityRegistrationQueueSize   = 2048
 	agentIdentityRegistrationMaxAttempts = 5
+	agentIdentityRegistrationHistorySize = 2000
 	agentIdentityRegistrationBaseBackoff = time.Second
 	agentIdentityRegistrationMaxBackoff  = 30 * time.Second
 )
@@ -44,9 +48,50 @@ type AgentIdentityRegistrationStatus struct {
 	NextRetryAt *time.Time `json:"next_retry_at,omitempty"`
 	ErrorCode   string     `json:"error_code,omitempty"`
 	Error       string     `json:"error,omitempty"`
+	Trigger     string     `json:"trigger,omitempty"`
 	Active      bool       `json:"active"`
 	CanRetry    bool       `json:"can_retry"`
 }
+
+// PendingAgentIdentity keeps an incomplete import visible to management while
+// making it impossible for the generic selector to send traffic through it.
+// Re-importing the same file with complete credentials replaces this runtime
+// and automatically enters the normal task-registration flow.
+type PendingAgentIdentity struct {
+	status AgentIdentityRegistrationStatus
+}
+
+func NewPendingAgentIdentity() *PendingAgentIdentity {
+	return &PendingAgentIdentity{status: AgentIdentityRegistrationStatus{
+		State:     AgentIdentityRegistrationCredentialsPending,
+		ErrorCode: "credentials_missing",
+		Error:     "Agent Identity credentials are incomplete. Re-import a complete export to continue automatic recovery.",
+		Active:    false,
+		CanRetry:  false,
+	}}
+}
+
+func (p *PendingAgentIdentity) RegistrationStatus() AgentIdentityRegistrationStatus {
+	if p == nil {
+		return AgentIdentityRegistrationStatus{
+			State:     AgentIdentityRegistrationCredentialsPending,
+			ErrorCode: "credentials_missing",
+		}
+	}
+	return registrationStatusSnapshot(p.status)
+}
+
+func (*PendingAgentIdentity) SetRegistrationClient(*http.Client) {}
+
+func (p *PendingAgentIdentity) RetryTaskRegistration() (AgentIdentityRegistrationStatus, bool) {
+	return p.RegistrationStatus(), false
+}
+
+func (p *PendingAgentIdentity) RebuildTaskRegistration() (AgentIdentityRegistrationStatus, bool) {
+	return p.RegistrationStatus(), false
+}
+
+func (*PendingAgentIdentity) RuntimeSelectionAvailable() bool { return false }
 
 type agentIdentityRegistrationError struct {
 	code      string
@@ -77,6 +122,18 @@ type agentIdentityRegistrationCoordinator struct {
 	maxAttempts int
 	baseBackoff time.Duration
 	maxBackoff  time.Duration
+
+	limitMu     sync.Mutex
+	limitCond   *sync.Cond
+	concurrency int
+	inFlight    int
+	waiting     int
+	closed      bool
+
+	historyMu       sync.RWMutex
+	history         []AgentIdentityRecoveryHistoryEntry
+	historyLimit    int
+	historySequence uint64
 }
 
 type agentIdentityRegistrationJob struct {
@@ -115,13 +172,16 @@ func newAgentIdentityRegistrationCoordinator(
 		maxBackoff = baseBackoff
 	}
 	c := &agentIdentityRegistrationCoordinator{
-		queue:       make(chan agentIdentityRegistrationJob, queueSize),
-		stop:        make(chan struct{}),
-		maxAttempts: maxAttempts,
-		baseBackoff: baseBackoff,
-		maxBackoff:  maxBackoff,
+		queue:        make(chan agentIdentityRegistrationJob, queueSize),
+		stop:         make(chan struct{}),
+		maxAttempts:  maxAttempts,
+		baseBackoff:  baseBackoff,
+		maxBackoff:   maxBackoff,
+		concurrency:  workers,
+		historyLimit: agentIdentityRegistrationHistorySize,
 	}
-	for range workers {
+	c.limitCond = sync.NewCond(&c.limitMu)
+	for range agentIdentityRegistrationMaxWorkers {
 		c.wg.Add(1)
 		go c.worker()
 	}
@@ -132,7 +192,13 @@ func (c *agentIdentityRegistrationCoordinator) close() {
 	if c == nil {
 		return
 	}
-	c.closeOnce.Do(func() { close(c.stop) })
+	c.closeOnce.Do(func() {
+		c.limitMu.Lock()
+		c.closed = true
+		c.limitCond.Broadcast()
+		c.limitMu.Unlock()
+		close(c.stop)
+	})
 	c.wg.Wait()
 }
 
@@ -157,9 +223,14 @@ func (c *agentIdentityRegistrationCoordinator) worker() {
 		case <-c.stop:
 			return
 		case job := <-c.queue:
-			if job.identity != nil {
-				job.identity.performTaskRegistration(c, job.generation)
+			if job.identity == nil {
+				continue
 			}
+			if !c.acquireRegistrationSlot() {
+				return
+			}
+			job.identity.performTaskRegistration(c, job.generation)
+			c.releaseRegistrationSlot()
 		}
 	}
 }
@@ -207,22 +278,28 @@ func (a *AgentIdentity) SetRegistrationClient(client *http.Client) {
 
 // StartTaskRegistration queues a missing task without blocking the caller.
 func (a *AgentIdentity) StartTaskRegistration() (AgentIdentityRegistrationStatus, bool) {
-	return a.queueTaskRegistration(nil, "", false)
+	return a.queueTaskRegistration(nil, "", false, false, "missing_task")
 }
 
 // QueueTaskRegistration invalidates the rejected task and schedules one
 // background registration. Concurrent calls collapse into the existing job.
 func (a *AgentIdentity) QueueTaskRegistration(client *http.Client, staleTaskID string) (AgentIdentityRegistrationStatus, bool) {
-	return a.queueTaskRegistration(client, staleTaskID, false)
+	return a.queueTaskRegistration(client, staleTaskID, false, false, "upstream_invalid_task")
 }
 
-// RetryTaskRegistration manually retries a failed registration. A deleted
-// runtime is terminal and requires importing fresh credentials.
+// RetryTaskRegistration manually retries a retryable failed registration.
 func (a *AgentIdentity) RetryTaskRegistration() (AgentIdentityRegistrationStatus, bool) {
-	return a.queueTaskRegistration(nil, "", true)
+	return a.queueTaskRegistration(nil, "", true, false, "manual_retry")
 }
 
-func (a *AgentIdentity) queueTaskRegistration(client *http.Client, staleTaskID string, manual bool) (AgentIdentityRegistrationStatus, bool) {
+// RebuildTaskRegistration invalidates the current task and attempts to register
+// a fresh task. It may recheck a previously deleted runtime, which is useful
+// after credentials are replaced or an upstream deletion classification was stale.
+func (a *AgentIdentity) RebuildTaskRegistration() (AgentIdentityRegistrationStatus, bool) {
+	return a.queueTaskRegistration(nil, "", true, true, "manual_rebuild")
+}
+
+func (a *AgentIdentity) queueTaskRegistration(client *http.Client, staleTaskID string, manual, force bool, trigger string) (AgentIdentityRegistrationStatus, bool) {
 	if a == nil {
 		return AgentIdentityRegistrationStatus{State: AgentIdentityRegistrationFailed}, false
 	}
@@ -232,10 +309,17 @@ func (a *AgentIdentity) queueTaskRegistration(client *http.Client, staleTaskID s
 	if client != nil {
 		a.registrationClient = client
 	}
+	if force && (a.registrationEnqueued || a.registrationStatus.State == AgentIdentityRegistrationRegistering || a.registrationStatus.State == AgentIdentityRegistrationRetryWait) {
+		return registrationStatusSnapshot(a.registrationStatus), false
+	}
 
 	a.mu.Lock()
 	currentTaskID := a.taskID
-	if staleTaskID != "" {
+	if force {
+		a.taskID = ""
+		a.selectionAvailable.Store(false)
+		currentTaskID = ""
+	} else if staleTaskID != "" {
 		if currentTaskID != "" && currentTaskID != staleTaskID {
 			a.mu.Unlock()
 			a.setRegistrationReadyLocked()
@@ -253,10 +337,10 @@ func (a *AgentIdentity) queueTaskRegistration(client *http.Client, staleTaskID s
 		a.setRegistrationReadyLocked()
 		return registrationStatusSnapshot(a.registrationStatus), false
 	}
-	if a.registrationStatus.State == AgentIdentityRegistrationRuntimeDeleted {
+	if a.registrationStatus.State == AgentIdentityRegistrationRuntimeDeleted && !force {
 		return registrationStatusSnapshot(a.registrationStatus), false
 	}
-	if manual && a.registrationStatus.State == AgentIdentityRegistrationFailed && !a.registrationStatus.CanRetry {
+	if manual && !force && a.registrationStatus.State == AgentIdentityRegistrationFailed && !a.registrationStatus.CanRetry {
 		return registrationStatusSnapshot(a.registrationStatus), false
 	}
 	if a.registrationEnqueued || a.registrationStatus.State == AgentIdentityRegistrationRegistering || a.registrationStatus.State == AgentIdentityRegistrationRetryWait {
@@ -281,11 +365,13 @@ func (a *AgentIdentity) queueTaskRegistration(client *http.Client, staleTaskID s
 	a.registrationStatus.NextRetryAt = nil
 	a.registrationStatus.ErrorCode = ""
 	a.registrationStatus.Error = ""
+	a.registrationStatus.Trigger = trigger
 	a.registrationStatus.Active = true
 	a.registrationStatus.CanRetry = false
 	a.selectionAvailable.Store(false)
 	a.registrationEnqueued = true
 	a.registrationGeneration++
+	a.beginRegistrationWaitLocked()
 	generation := a.registrationGeneration
 
 	coordinator := a.registrationCoordinator
@@ -311,6 +397,74 @@ func (a *AgentIdentity) RegistrationStatus() AgentIdentityRegistrationStatus {
 	return registrationStatusSnapshot(a.registrationStatus)
 }
 
+func (a *AgentIdentity) waitForTaskRegistration(ctx context.Context) error {
+	if a == nil {
+		return errors.New("agent identity is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		a.registrationMu.Lock()
+		status := registrationStatusSnapshot(a.registrationStatus)
+		done := a.registrationDone
+		a.registrationMu.Unlock()
+
+		switch status.State {
+		case AgentIdentityRegistrationReady:
+			if a.key().taskID == "" {
+				return errors.New("agent identity recovery completed without a task")
+			}
+			return nil
+		case AgentIdentityRegistrationRuntimeDeleted:
+			return ErrAgentIdentityRuntimeDeleted
+		case AgentIdentityRegistrationCredentialsPending:
+			return ErrAgentIdentityCredentialsMissing
+		case AgentIdentityRegistrationFailed:
+			return registrationStatusError(status)
+		}
+		if done == nil {
+			return ErrAgentIdentityRegistrationPending
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+	}
+}
+
+func registrationStatusError(status AgentIdentityRegistrationStatus) error {
+	message := strings.TrimSpace(status.Error)
+	if message == "" {
+		message = "Task registration failed."
+	}
+	code := strings.TrimSpace(status.ErrorCode)
+	if code == "" {
+		code = "registration_failed"
+	}
+	return &agentIdentityRegistrationError{
+		code:      code,
+		message:   message,
+		retryable: status.CanRetry,
+	}
+}
+
+func (a *AgentIdentity) beginRegistrationWaitLocked() {
+	if a.registrationDone != nil {
+		close(a.registrationDone)
+	}
+	a.registrationDone = make(chan struct{})
+}
+
+func (a *AgentIdentity) finishRegistrationWaitLocked() {
+	if a.registrationDone == nil {
+		return
+	}
+	close(a.registrationDone)
+	a.registrationDone = nil
+}
+
 // RuntimeSelectionAvailable lets the generic auth selector skip credentials
 // while their task is missing or being repaired. The same runtime becomes
 // selectable immediately after a successful background registration.
@@ -328,12 +482,18 @@ func (a *AgentIdentity) MarkRuntimeDeleted() {
 		return
 	}
 	a.registrationMu.Lock()
+	alreadyDeleted := a.registrationStatus.State == AgentIdentityRegistrationRuntimeDeleted
 	persist := a.setRegistrationRuntimeDeletedLocked()
+	status := registrationStatusSnapshot(a.registrationStatus)
+	coordinator := a.registrationCoordinator
 	a.registrationMu.Unlock()
 	persistAgentIdentityRuntimeDeleted(persist)
+	if !alreadyDeleted && coordinator != nil {
+		coordinator.recordAttempt(a, status, time.Now().UTC())
+	}
 }
 
-func (a *AgentIdentity) setRegistrationRuntimeDeletedLocked() func(context.Context, string) error {
+func (a *AgentIdentity) setRegistrationRuntimeDeletedLocked() func(context.Context, string, string) error {
 	if a.registrationStatus.State == AgentIdentityRegistrationRuntimeDeleted {
 		return nil
 	}
@@ -353,8 +513,10 @@ func (a *AgentIdentity) setRegistrationRuntimeDeletedLocked() func(context.Conte
 	a.registrationStatus.NextRetryAt = nil
 	a.registrationStatus.ErrorCode = "runtime_deleted"
 	a.registrationStatus.Error = "Agent runtime has been deleted. Import fresh credentials to recover this account."
+	a.registrationStatus.Trigger = "upstream_runtime_deleted"
 	a.registrationStatus.Active = false
 	a.registrationStatus.CanRetry = false
+	a.finishRegistrationWaitLocked()
 	return a.persist
 }
 
@@ -373,6 +535,7 @@ func (a *AgentIdentity) performTaskRegistration(coordinator *agentIdentityRegist
 	a.registrationStatus.StartedAt = &now
 	a.registrationStatus.NextRetryAt = nil
 	client := a.registrationClient
+	persist := a.persist
 	a.registrationMu.Unlock()
 
 	if client == nil {
@@ -382,6 +545,12 @@ func (a *AgentIdentity) performTaskRegistration(coordinator *agentIdentityRegist
 		})
 		return
 	}
+	if persist != nil {
+		if errPersist := persist(context.Background(), "", AgentIdentityRegistrationQueued); errPersist != nil {
+			a.finishTaskRegistration(coordinator, generation, "", errPersist)
+			return
+		}
+	}
 
 	taskID, err := registerAgentIdentityTask(context.Background(), client, a.key())
 	a.finishTaskRegistration(coordinator, generation, taskID, err)
@@ -389,19 +558,30 @@ func (a *AgentIdentity) performTaskRegistration(coordinator *agentIdentityRegist
 
 func (a *AgentIdentity) finishTaskRegistration(coordinator *agentIdentityRegistrationCoordinator, generation uint64, taskID string, err error) {
 	a.registrationMu.Lock()
-	var persistRuntimeDeleted func(context.Context, string) error
+	var persistRuntimeDeleted func(context.Context, string, string) error
+	var recordAttempt bool
+	var recordStatus AgentIdentityRegistrationStatus
+	var recordFinishedAt time.Time
 	defer func() {
+		if recordAttempt {
+			recordStatus = registrationStatusSnapshot(a.registrationStatus)
+			recordFinishedAt = time.Now().UTC()
+		}
 		a.registrationMu.Unlock()
 		persistAgentIdentityRuntimeDeleted(persistRuntimeDeleted)
+		if recordAttempt && coordinator != nil {
+			coordinator.recordAttempt(a, recordStatus, recordFinishedAt)
+		}
 	}()
 	if generation != a.registrationGeneration || a.registrationStatus.State != AgentIdentityRegistrationRegistering {
 		return
 	}
+	recordAttempt = true
 
 	if err == nil && taskID != "" {
 		persist := a.persist
 		if persist != nil {
-			if errPersist := persist(context.Background(), taskID); errPersist != nil {
+			if errPersist := persist(context.Background(), taskID, AgentIdentityRegistrationReady); errPersist != nil {
 				if errors.Is(errPersist, ErrAgentIdentityCredentialsChanged) {
 					a.setRegistrationFailedLocked(
 						"credentials_changed",
@@ -419,6 +599,14 @@ func (a *AgentIdentity) finishTaskRegistration(coordinator *agentIdentityRegistr
 		a.mu.Unlock()
 		a.selectionAvailable.Store(true)
 		a.setRegistrationReadyLocked()
+		return
+	}
+	if errors.Is(err, ErrAgentIdentityCredentialsChanged) {
+		a.setRegistrationFailedLocked(
+			"credentials_changed",
+			"Credentials changed while task registration was in progress.",
+			false,
+		)
 		return
 	}
 
@@ -446,11 +634,11 @@ func (a *AgentIdentity) finishTaskRegistration(coordinator *agentIdentityRegistr
 	a.setRegistrationFailedLocked(registrationErr.code, registrationErr.message, true)
 }
 
-func persistAgentIdentityRuntimeDeleted(persist func(context.Context, string) error) {
+func persistAgentIdentityRuntimeDeleted(persist func(context.Context, string, string) error) {
 	if persist == nil {
 		return
 	}
-	if err := persist(context.Background(), ""); err != nil && !errors.Is(err, ErrAgentIdentityCredentialsChanged) {
+	if err := persist(context.Background(), "", AgentIdentityRegistrationRuntimeDeleted); err != nil && !errors.Is(err, ErrAgentIdentityCredentialsChanged) {
 		log.WithError(err).Warn("failed to persist deleted agent identity runtime state")
 	}
 }
@@ -483,6 +671,7 @@ func (a *AgentIdentity) setRegistrationReadyLocked() {
 	a.registrationStatus.CanRetry = false
 	a.registrationEnqueued = false
 	a.selectionAvailable.Store(true)
+	a.finishRegistrationWaitLocked()
 }
 
 func (a *AgentIdentity) setRegistrationFailedLocked(code, message string, canRetry bool) {
@@ -495,6 +684,7 @@ func (a *AgentIdentity) setRegistrationFailedLocked(code, message string, canRet
 	a.registrationStatus.Active = false
 	a.registrationStatus.CanRetry = canRetry
 	a.selectionAvailable.Store(false)
+	a.finishRegistrationWaitLocked()
 }
 
 func registrationStatusSnapshot(status AgentIdentityRegistrationStatus) AgentIdentityRegistrationStatus {

@@ -950,8 +950,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.GET("/auth-files/agent-identity/registrations", s.mgmt.ListAgentIdentityRegistrations)
+		mgmt.GET("/auth-files/agent-identity/recovery", s.mgmt.ListAgentIdentityRecovery)
+		mgmt.PUT("/auth-files/agent-identity/recovery/config", s.mgmt.PutAgentIdentityRecoveryConfig)
 		mgmt.POST("/auth-files/agent-identity/register", s.mgmt.RegisterAgentIdentityTask)
 		mgmt.POST("/auth-files/agent-identity/register-batch", s.mgmt.RegisterAgentIdentityTasks)
+		mgmt.POST("/auth-files/agent-identity/rebuild", s.mgmt.RebuildAgentIdentityTask)
+		mgmt.POST("/auth-files/agent-identity/rebuild-batch", s.mgmt.RebuildAgentIdentityTasks)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)

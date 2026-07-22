@@ -33,6 +33,12 @@ const (
 
 var agentIdentityAuthAPIBaseURLForTest string
 
+// ErrAgentIdentityCredentialsMissing marks an import that identifies itself as
+// Agent Identity but does not yet contain enough signing material to serve
+// traffic. Management imports may persist this state for later recovery, while
+// malformed signing material remains a hard validation error.
+var ErrAgentIdentityCredentialsMissing = errors.New("agent identity runtime id or private key is missing")
+
 // AgentIdentityCredentials contains the non-OAuth fields exported for a K12
 // agent identity. PrivateKey is a base64-encoded PKCS#8 Ed25519 private key.
 type AgentIdentityCredentials struct {
@@ -52,13 +58,15 @@ type AgentIdentity struct {
 	taskID string
 
 	registrationMu          sync.Mutex
-	persist                 func(context.Context, string) error
+	persist                 func(context.Context, string, string) error
 	registrationClient      *http.Client
 	registrationCoordinator *agentIdentityRegistrationCoordinator
 	registrationStatus      AgentIdentityRegistrationStatus
 	registrationEnqueued    bool
 	registrationRetryTimer  *time.Timer
 	registrationGeneration  uint64
+	registrationDone        chan struct{}
+	registrationName        string
 	selectionAvailable      atomic.Bool
 }
 
@@ -118,7 +126,7 @@ func parseAgentIdentityPrivateKey(encoded string) (ed25519.PrivateKey, error) {
 
 // SetTaskPersister installs a callback used after task replacement. The
 // callback must not log credentials or assertion values.
-func (a *AgentIdentity) SetTaskPersister(persist func(context.Context, string) error) {
+func (a *AgentIdentity) SetTaskPersister(persist func(context.Context, string, string) error) {
 	if a == nil {
 		return
 	}
@@ -134,6 +142,22 @@ func (a *AgentIdentity) Matches(credentials AgentIdentityCredentials) bool {
 	}
 	return a.runtimeID == strings.TrimSpace(credentials.RuntimeID) &&
 		a.encodedPrivateKey == strings.TrimSpace(credentials.PrivateKey)
+}
+
+// MatchesRuntime reports whether an auth-file refresh describes the exact
+// runtime currently installed, including its task. It lets the file watcher
+// retain the live recovery state when task persistence rewrites the auth file,
+// while still honoring an externally replaced task or signing identity.
+func (a *AgentIdentity) MatchesRuntime(other *AgentIdentity) bool {
+	if a == nil || other == nil {
+		return false
+	}
+	if a == other {
+		return true
+	}
+	return a.runtimeID == other.runtimeID &&
+		a.encodedPrivateKey == other.encodedPrivateKey &&
+		a.key().taskID == other.key().taskID
 }
 
 func (a *AgentIdentity) key() agentIdentityKey {
@@ -327,11 +351,11 @@ func (a *AgentIdentity) Authorization(ctx context.Context, client *http.Client) 
 	}
 	key := a.key()
 	if key.taskID == "" {
-		status, _ := a.QueueTaskRegistration(client, "")
-		if status.State == AgentIdentityRegistrationRuntimeDeleted {
-			return "", "", ErrAgentIdentityRuntimeDeleted
+		a.QueueTaskRegistration(client, "")
+		if err := a.waitForTaskRegistration(ctx); err != nil {
+			return "", "", err
 		}
-		return "", "", ErrAgentIdentityRegistrationPending
+		key = a.key()
 	}
 	assertion, err := buildAgentAssertion(key, time.Now())
 	if err != nil {
@@ -340,14 +364,15 @@ func (a *AgentIdentity) Authorization(ctx context.Context, client *http.Client) 
 	return assertion, key.taskID, nil
 }
 
-// RecoverAuthorization queues an explicitly rejected task for replacement.
-// Concurrent recoveries collapse into one background registration.
+// RecoverAuthorization replaces an explicitly rejected task and returns a
+// fresh assertion. Registration remains bounded by the shared worker pool,
+// while concurrent callers wait on the same recovery generation.
 func (a *AgentIdentity) RecoverAuthorization(ctx context.Context, client *http.Client, staleTaskID string) (string, error) {
-	status, _ := a.QueueTaskRegistration(client, strings.TrimSpace(staleTaskID))
-	if status.State == AgentIdentityRegistrationRuntimeDeleted {
-		return "", ErrAgentIdentityRuntimeDeleted
+	a.QueueTaskRegistration(client, strings.TrimSpace(staleTaskID))
+	if err := a.waitForTaskRegistration(ctx); err != nil {
+		return "", err
 	}
-	return "", ErrAgentIdentityRegistrationPending
+	return buildAgentAssertion(a.key(), time.Now())
 }
 
 // IsAgentIdentityTaskInvalidResponse recognizes only errors that safely allow
@@ -446,11 +471,13 @@ func ParseAgentIdentityMetadata(metadata map[string]any) (AgentIdentityCredentia
 	if !handled {
 		return AgentIdentityCredentials{}, false, nil
 	}
-	if credentials.RuntimeID == "" || credentials.PrivateKey == "" {
-		return AgentIdentityCredentials{}, true, errors.New("agent identity runtime id or private key is missing")
+	if credentials.PrivateKey != "" {
+		if err := ValidateAgentIdentityPrivateKey(credentials.PrivateKey); err != nil {
+			return credentials, true, err
+		}
 	}
-	if err := ValidateAgentIdentityPrivateKey(credentials.PrivateKey); err != nil {
-		return AgentIdentityCredentials{}, true, err
+	if credentials.RuntimeID == "" || credentials.PrivateKey == "" {
+		return credentials, true, ErrAgentIdentityCredentialsMissing
 	}
 	return credentials, true, nil
 }

@@ -28,16 +28,48 @@ func (*agentIdentityRuntime) ShouldRefresh(time.Time, *coreauth.Auth) bool {
 	return false
 }
 
+// CanReuseForAuthUpdate prevents an auth-file persistence event from replacing
+// an in-flight recovery runtime with a second runtime for the same credentials.
+func (r *agentIdentityRuntime) CanReuseForAuthUpdate(next any) bool {
+	other, ok := next.(*agentIdentityRuntime)
+	return ok && r != nil && other != nil && r.AgentIdentity.MatchesRuntime(other.AgentIdentity)
+}
+
+// StartBackgroundRecovery is called only after the auth runtime is installed.
+// StartTaskRegistration is idempotent, so calling it for an existing runtime is
+// safe and also repairs a missing task after process startup.
+func (r *agentIdentityRuntime) StartBackgroundRecovery() {
+	if r != nil && r.AgentIdentity != nil {
+		r.StartTaskRegistration()
+	}
+}
+
 func attachAgentIdentityRuntime(auth *coreauth.Auth, path string, cfg *config.Config) error {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return nil
 	}
 	credentials, handled, err := codexauth.ParseAgentIdentityMetadata(auth.Metadata)
 	if err != nil {
+		if errors.Is(err, codexauth.ErrAgentIdentityCredentialsMissing) {
+			auth.Runtime = codexauth.NewPendingAgentIdentity()
+			auth.Unavailable = true
+			auth.StatusMessage = "Agent Identity credentials are pending recovery."
+			if auth.Attributes == nil {
+				auth.Attributes = make(map[string]string)
+			}
+			auth.Attributes[coreauth.AttributeAuthKind] = coreauth.AuthKindOAuth
+			return nil
+		}
 		return err
 	}
 	if !handled {
 		return nil
+	}
+	if cfg != nil {
+		codexauth.ConfigureAgentIdentityRecovery(
+			cfg.AgentIdentityRecovery.Concurrency,
+			cfg.AgentIdentityRecovery.HistoryLimit,
+		)
 	}
 	runtime, err := codexauth.NewAgentIdentity(credentials)
 	if err != nil {
@@ -50,8 +82,9 @@ func attachAgentIdentityRuntime(auth *coreauth.Auth, path string, cfg *config.Co
 	if runtimeDeleted {
 		runtime.MarkRuntimeDeleted()
 	}
-	runtime.SetTaskPersister(func(ctx context.Context, taskID string) error {
-		return persistAgentIdentityTask(ctx, path, credentials.RuntimeID, credentials.PrivateKey, taskID)
+	runtime.SetRegistrationName(filepath.Base(path))
+	runtime.SetTaskPersister(func(ctx context.Context, taskID, state string) error {
+		return persistAgentIdentityTask(ctx, path, credentials.RuntimeID, credentials.PrivateKey, taskID, state)
 	})
 	runtime.SetRegistrationClient(newAgentIdentityRegistrationClient(cfg, auth))
 	auth.Runtime = &agentIdentityRuntime{AgentIdentity: runtime}
@@ -59,9 +92,9 @@ func attachAgentIdentityRuntime(auth *coreauth.Auth, path string, cfg *config.Co
 		auth.Attributes = make(map[string]string)
 	}
 	auth.Attributes[coreauth.AttributeAuthKind] = coreauth.AuthKindOAuth
-	if credentials.TaskID == "" && !runtimeDeleted {
-		runtime.StartTaskRegistration()
-	}
+	// Recovery starts after the auth is installed by management or the core
+	// service. Starting here would let a file-watcher rewrite enqueue a second
+	// registration before the existing runtime can be reused.
 	return nil
 }
 
@@ -84,12 +117,13 @@ func newAgentIdentityRegistrationClient(cfg *config.Config, auth *coreauth.Auth)
 	return &http.Client{Transport: transport}
 }
 
-func persistAgentIdentityTask(ctx context.Context, path, runtimeID, privateKey, taskID string) error {
+func persistAgentIdentityTask(ctx context.Context, path, runtimeID, privateKey, taskID, state string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	path = strings.TrimSpace(path)
 	taskID = strings.TrimSpace(taskID)
+	state = strings.TrimSpace(state)
 	if path == "" {
 		return errors.New("agent identity task persistence path is empty")
 	}
@@ -110,7 +144,11 @@ func persistAgentIdentityTask(ctx context.Context, path, runtimeID, privateKey, 
 	}
 	if taskID == "" {
 		clearAgentIdentityTask(metadata)
-		metadata[agentIdentityRegistrationStateKey] = codexauth.AgentIdentityRegistrationRuntimeDeleted
+		if state == codexauth.AgentIdentityRegistrationRuntimeDeleted {
+			metadata[agentIdentityRegistrationStateKey] = codexauth.AgentIdentityRegistrationRuntimeDeleted
+		} else {
+			metadata[agentIdentityRegistrationStateKey] = codexauth.AgentIdentityRegistrationQueued
+		}
 	} else {
 		metadata["task_id"] = taskID
 		delete(metadata, agentIdentityRegistrationStateKey)

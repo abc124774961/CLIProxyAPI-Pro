@@ -159,6 +159,12 @@ video-result-auth-cache-ttl: "3h"
 # When > 0, overrides the default worker count (16).
 # auth-auto-refresh-workers: 16
 
+# Agent Identity task registration and recovery pool.
+# Missing or invalid tasks recover asynchronously and are not selected until ready.
+agent-identity-recovery:
+  concurrency: 6 # Live-adjustable worker limit, clamped to 1-64.
+  history-limit: 2000 # Completed recovery attempts retained in memory, max 10000.
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded

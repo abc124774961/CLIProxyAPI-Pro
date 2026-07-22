@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 )
@@ -64,6 +65,71 @@ func TestParseAgentIdentityBundleRejectsMalformedKey(t *testing.T) {
 	files, handled, err := ParseAgentIdentityBundle(payload)
 	if err == nil || !handled || len(files) != 0 {
 		t.Fatalf("files=%d handled=%v err=%v", len(files), handled, err)
+	}
+}
+
+func TestParseAgentIdentityBundleRemovesSyntheticIDToken(t *testing.T) {
+	_, _, encoded := newTestAgentIdentity(t, "runtime-synthetic", "task-synthetic")
+	header, err := json.Marshal(map[string]any{
+		"alg":           "none",
+		"typ":           "JWT",
+		"cpa_synthetic": true,
+	})
+	if err != nil {
+		t.Fatalf("Marshal header: %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{"email": "synthetic@example.com"})
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	token := base64.RawURLEncoding.EncodeToString(header) + "." +
+		base64.RawURLEncoding.EncodeToString(payload) + ".synthetic"
+	bundle, err := json.Marshal(map[string]any{
+		"accounts": []map[string]any{{
+			"name": "synthetic",
+			"credentials": map[string]any{
+				"auth_mode":         "agentIdentity",
+				"agent_runtime_id":  "runtime-synthetic",
+				"agent_private_key": encoded,
+				"task_id":           "task-synthetic",
+				"id_token":          token,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal bundle: %v", err)
+	}
+
+	files, handled, err := ParseAgentIdentityBundle(bundle)
+	if err != nil || !handled || len(files) != 1 {
+		t.Fatalf("files=%d handled=%v err=%v", len(files), handled, err)
+	}
+	if _, exists := files[0].Metadata["id_token"]; exists {
+		t.Fatal("synthetic id_token must not be persisted")
+	}
+	if files[0].Metadata["agent_runtime_id"] != "runtime-synthetic" ||
+		files[0].Metadata["agent_private_key"] != encoded ||
+		files[0].Metadata["task_id"] != "task-synthetic" {
+		t.Fatal("agent identity credentials changed while sanitizing the bundle")
+	}
+}
+
+func TestParseAgentIdentityBundleAcceptsPendingCredentials(t *testing.T) {
+	payload := []byte(`{"accounts":[
+		{"name":"pending-one@example.com","credentials":{"auth_mode":"agentIdentity","email":"pending-one@example.com"}},
+		{"name":"pending-two@example.com","credentials":{"auth_mode":"agentIdentity","email":"pending-two@example.com"}}
+	]}`)
+	files, handled, err := ParseAgentIdentityBundle(payload)
+	if err != nil || !handled || len(files) != 2 {
+		t.Fatalf("files=%d handled=%v err=%v", len(files), handled, err)
+	}
+	if files[0].FileName == files[1].FileName {
+		t.Fatal("pending imports must keep stable unique filenames")
+	}
+	for _, file := range files {
+		if file.Metadata["agent_identity_registration_state"] != AgentIdentityRegistrationCredentialsPending {
+			t.Fatalf("pending state = %v", file.Metadata["agent_identity_registration_state"])
+		}
 	}
 }
 

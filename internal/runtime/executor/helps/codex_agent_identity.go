@@ -47,9 +47,10 @@ func CodexAgentIdentityRuntime(auth *cliproxyauth.Auth) (CodexAgentIdentity, boo
 	return runtime, ok && runtime != nil
 }
 
-// DoCodexRequestWithAgentRecovery performs one upstream request and queues a
-// rejected agent task for background replacement. Non-agent requests retain
-// their old path and the current request can move to another credential.
+// DoCodexRequestWithAgentRecovery performs one upstream request and replaces a
+// rejected agent task at most once. Recovery uses the bounded background pool,
+// but this request waits for that shared recovery and replays once before
+// falling back to another credential.
 func DoCodexRequestWithAgentRecovery(
 	ctx context.Context,
 	auth *cliproxyauth.Auth,
@@ -87,11 +88,34 @@ func DoCodexRequestWithAgentRecovery(
 	if authClient == nil {
 		return nil, errors.New("codex agent identity HTTP client is nil")
 	}
-	_, errRecover := runtime.RecoverAuthorization(ctx, authClient, staleTaskID)
+	authorization, errRecover := runtime.RecoverAuthorization(ctx, authClient, staleTaskID)
 	if errRecover != nil {
-		return nil, fmt.Errorf("queue codex agent identity task recovery: %w", errRecover)
+		return nil, fmt.Errorf("recover codex agent identity task: %w", errRecover)
 	}
-	return nil, codexauth.ErrAgentIdentityRegistrationPending
+	retryReq, errClone := cloneCodexRequestForRetry(ctx, req)
+	if errClone != nil {
+		return nil, errClone
+	}
+	retryReq.Header.Set("Authorization", authorization)
+	retryResp, errRetry := upstreamClient.Do(retryReq)
+	if errRetry != nil {
+		return nil, errRetry
+	}
+	return redactCodexAgentIdentityErrorResponse(runtime, retryResp), nil
+}
+
+func cloneCodexRequestForRetry(ctx context.Context, req *http.Request) (*http.Request, error) {
+	if req.GetBody == nil {
+		return nil, errors.New("codex agent identity request body cannot be replayed")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("reopen codex request body: %w", err)
+	}
+	retryReq := req.Clone(ctx)
+	retryReq.Body = body
+	retryReq.GetBody = req.GetBody
+	return retryReq, nil
 }
 
 func redactCodexAgentIdentityErrorResponse(runtime CodexAgentIdentity, resp *http.Response) *http.Response {

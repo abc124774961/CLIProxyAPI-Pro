@@ -92,6 +92,9 @@ type Config struct {
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
 
+	// AgentIdentityRecovery controls the asynchronous Agent Identity task recovery pool.
+	AgentIdentityRecovery AgentIdentityRecoveryConfig `yaml:"agent-identity-recovery,omitempty" json:"agent-identity-recovery"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
@@ -170,6 +173,37 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+const (
+	DefaultAgentIdentityRecoveryConcurrency = 6
+	MaxAgentIdentityRecoveryConcurrency     = 64
+	DefaultAgentIdentityRecoveryHistory     = 2000
+	MaxAgentIdentityRecoveryHistory         = 10000
+)
+
+// AgentIdentityRecoveryConfig controls Agent Identity task registration and
+// recovery. Zero values are normalized to safe production defaults.
+type AgentIdentityRecoveryConfig struct {
+	Concurrency  int `yaml:"concurrency,omitempty" json:"concurrency"`
+	HistoryLimit int `yaml:"history-limit,omitempty" json:"history-limit"`
+}
+
+// Normalize clamps Agent Identity recovery settings and fills defaults.
+func (c *AgentIdentityRecoveryConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	if c.Concurrency <= 0 {
+		c.Concurrency = DefaultAgentIdentityRecoveryConcurrency
+	} else if c.Concurrency > MaxAgentIdentityRecoveryConcurrency {
+		c.Concurrency = MaxAgentIdentityRecoveryConcurrency
+	}
+	if c.HistoryLimit <= 0 {
+		c.HistoryLimit = DefaultAgentIdentityRecoveryHistory
+	} else if c.HistoryLimit > MaxAgentIdentityRecoveryHistory {
+		c.HistoryLimit = MaxAgentIdentityRecoveryHistory
+	}
 }
 
 // PluginsConfig holds dynamic plugin system settings.
@@ -731,6 +765,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
 				cfg := &Config{}
+				cfg.AgentIdentityRecovery.Normalize()
 				cfg.NormalizePluginsConfig()
 				return cfg, nil
 			}
@@ -741,6 +776,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
 		cfg := &Config{}
+		cfg.AgentIdentityRecovery.Normalize()
 		cfg.NormalizePluginsConfig()
 		return cfg, nil
 	}
@@ -757,6 +793,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.DisableCooling = false
 	cfg.SaveCooldownStatus = false
 	cfg.TransientErrorCooldownSeconds = 0
+	cfg.AgentIdentityRecovery.Concurrency = DefaultAgentIdentityRecoveryConcurrency
+	cfg.AgentIdentityRecovery.HistoryLimit = DefaultAgentIdentityRecoveryHistory
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false
@@ -766,6 +804,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
 			cfgOptional := &Config{}
+			cfgOptional.AgentIdentityRecovery.Normalize()
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
@@ -814,6 +853,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+
+	cfg.AgentIdentityRecovery.Normalize()
 
 	cfg.NormalizePluginsConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {

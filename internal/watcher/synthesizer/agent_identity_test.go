@@ -84,7 +84,7 @@ func TestPersistAgentIdentityTask(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := persistAgentIdentityTask(context.Background(), path, "runtime-persist", privateKey, "task-new"); err != nil {
+	if err := persistAgentIdentityTask(context.Background(), path, "runtime-persist", privateKey, "task-new", codexauth.AgentIdentityRegistrationReady); err != nil {
 		t.Fatalf("persistAgentIdentityTask: %v", err)
 	}
 	updated, err := os.ReadFile(path)
@@ -116,7 +116,7 @@ func TestPersistAgentIdentityTaskRejectsReplacedCredentials(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if err := persistAgentIdentityTask(context.Background(), path, "runtime-reused", originalKey, "task-stale"); !errors.Is(err, codexauth.ErrAgentIdentityCredentialsChanged) {
+	if err := persistAgentIdentityTask(context.Background(), path, "runtime-reused", originalKey, "task-stale", codexauth.AgentIdentityRegistrationReady); !errors.Is(err, codexauth.ErrAgentIdentityCredentialsChanged) {
 		t.Fatalf("persistence error = %v, want credentials changed", err)
 	}
 	updated, err := os.ReadFile(path)
@@ -150,7 +150,7 @@ func TestPersistAgentIdentityRuntimeDeletedState(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if err := persistAgentIdentityTask(context.Background(), path, "runtime-deleted", privateKey, ""); err != nil {
+	if err := persistAgentIdentityTask(context.Background(), path, "runtime-deleted", privateKey, "", codexauth.AgentIdentityRegistrationRuntimeDeleted); err != nil {
 		t.Fatalf("persistAgentIdentityTask deleted state: %v", err)
 	}
 	updated, err := os.ReadFile(path)
@@ -209,5 +209,25 @@ func TestSynthesizeRejectsMalformedAgentIdentityKey(t *testing.T) {
 	ctx := &SynthesisContext{Config: &config.Config{}, AuthDir: t.TempDir(), Now: time.Now()}
 	if auths := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "bad.json"), data); len(auths) != 0 {
 		t.Fatalf("auths = %d, want 0", len(auths))
+	}
+}
+
+func TestSynthesizeQuarantinesPendingAgentIdentityCredentials(t *testing.T) {
+	data := []byte(`{"type":"codex","auth_mode":"agentIdentity","account_id":"account-placeholder","email":"pending@example.com"}`)
+	ctx := &SynthesisContext{Config: &config.Config{}, AuthDir: t.TempDir(), Now: time.Now()}
+	auths := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "pending.json"), data)
+	if len(auths) != 1 {
+		t.Fatalf("auths = %d, want 1", len(auths))
+	}
+	runtime, ok := auths[0].Runtime.(*codexauth.PendingAgentIdentity)
+	if !ok || runtime == nil {
+		t.Fatalf("runtime type = %T, want pending agent identity", auths[0].Runtime)
+	}
+	status := runtime.RegistrationStatus()
+	if status.State != codexauth.AgentIdentityRegistrationCredentialsPending {
+		t.Fatalf("registration status = %+v", status)
+	}
+	if runtime.RuntimeSelectionAvailable() || !auths[0].Unavailable {
+		t.Fatalf("pending auth available=%v unavailable=%v", runtime.RuntimeSelectionAvailable(), auths[0].Unavailable)
 	}
 }

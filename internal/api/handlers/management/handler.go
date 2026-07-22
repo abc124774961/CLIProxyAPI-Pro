@@ -81,6 +81,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 	}
+	configureAgentIdentityRecoveryFromConfig(cfg)
 	h.startAttemptCleanup()
 	return h
 }
@@ -128,6 +129,7 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 	h.mu.Lock()
 	h.cfg = cfg
 	h.mu.Unlock()
+	configureAgentIdentityRecoveryFromConfig(cfg)
 }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.

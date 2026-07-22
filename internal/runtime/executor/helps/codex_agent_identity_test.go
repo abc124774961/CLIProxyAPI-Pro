@@ -6,13 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -90,17 +88,14 @@ func TestDoCodexRequestWithAgentRecovery(t *testing.T) {
 	}
 	req.Header.Set("Authorization", authorization)
 	resp, err := DoCodexRequestWithAgentRecovery(context.Background(), auth, client, client, req, staleTaskID)
-	if !errors.Is(err, codexauth.ErrAgentIdentityRegistrationPending) {
+	if err != nil {
 		t.Fatalf("DoCodexRequestWithAgentRecovery error = %v", err)
 	}
-	if resp != nil {
-		t.Fatalf("response = %#v, want nil while recovery is queued", resp)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("response status = %d, want 200", resp.StatusCode)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && runtime.RegistrationStatus().State != codexauth.AgentIdentityRegistrationReady {
-		time.Sleep(time.Millisecond)
-	}
-	if registrations != 1 || len(upstreamAuthorizations) != 1 {
+	if registrations != 1 || len(upstreamAuthorizations) != 2 {
 		t.Fatalf("registrations=%d upstream attempts=%d", registrations, len(upstreamAuthorizations))
 	}
 	if runtime.RegistrationStatus().State != codexauth.AgentIdentityRegistrationReady {
@@ -108,6 +103,9 @@ func TestDoCodexRequestWithAgentRecovery(t *testing.T) {
 	}
 	if !strings.HasPrefix(upstreamAuthorizations[0], "AgentAssertion ") {
 		t.Fatalf("authorization scheme = %q", upstreamAuthorizations[0])
+	}
+	if upstreamAuthorizations[0] == upstreamAuthorizations[1] {
+		t.Fatal("retry reused the rejected AgentAssertion")
 	}
 }
 

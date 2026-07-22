@@ -1005,6 +1005,7 @@ func (h *Handler) writeAuthFileWithDefaults(
 		return errBundle
 	}
 	if handled {
+		existingNames := h.existingAgentIdentityImportNames()
 		for _, item := range imports {
 			applyAuthFileImportDefaults(item.Metadata, defaults)
 			canonical, errMarshal := json.MarshalIndent(item.Metadata, "", "  ")
@@ -1012,7 +1013,18 @@ func (h *Handler) writeAuthFileWithDefaults(
 				return fmt.Errorf("serialize agent identity auth file: %w", errMarshal)
 			}
 			canonical = append(canonical, '\n')
-			if errWrite := h.writeSingleAuthFile(ctx, item.FileName, canonical); errWrite != nil {
+			name := item.FileName
+			for _, identity := range agentIdentityAccountLookupKeys(item.Metadata) {
+				if existingName := existingNames[identity]; existingName != "" {
+					name = existingName
+					delete(existingNames, identity)
+					break
+				}
+			}
+			if identity := agentIdentityAccountKey(item.Metadata); identity != "" {
+				existingNames[identity] = name
+			}
+			if errWrite := h.writeSingleAuthFile(ctx, name, canonical); errWrite != nil {
 				return errWrite
 			}
 		}
@@ -1043,6 +1055,64 @@ func (h *Handler) writeAuthFileWithDefaults(
 		return errDefaults
 	}
 	return h.writeSingleAuthFile(ctx, name, dataWithDefaults)
+}
+
+func (h *Handler) existingAgentIdentityImportNames() map[string]string {
+	names := make(map[string]string)
+	if h == nil || h.cfg == nil {
+		return names
+	}
+	entries, errReadDir := os.ReadDir(h.cfg.AuthDir)
+	if errReadDir != nil {
+		return names
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		data, errRead := os.ReadFile(filepath.Join(h.cfg.AuthDir, entry.Name()))
+		if errRead != nil {
+			continue
+		}
+		metadata := make(map[string]any)
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			continue
+		}
+		if _, handled, _ := codex.ParseAgentIdentityMetadata(metadata); !handled {
+			continue
+		}
+		identity := agentIdentityAccountKey(metadata)
+		if identity == "" {
+			continue
+		}
+		if _, exists := names[identity]; !exists {
+			names[identity] = entry.Name()
+		}
+	}
+	return names
+}
+
+func agentIdentityAccountKey(metadata map[string]any) string {
+	keys := agentIdentityAccountLookupKeys(metadata)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func agentIdentityAccountLookupKeys(metadata map[string]any) []string {
+	keys := make([]string, 0, 3)
+	credentials, handled, _ := codex.ParseAgentIdentityMetadata(metadata)
+	if handled && credentials.RuntimeID != "" {
+		keys = append(keys, "runtime:"+credentials.RuntimeID)
+	}
+	if email := authMetadataString(metadata, "email", "name"); email != "" {
+		keys = append(keys, "email:"+strings.ToLower(email))
+	}
+	if accountID := authMetadataString(metadata, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId"); accountID != "" {
+		keys = append(keys, "account:"+accountID)
+	}
+	return keys
 }
 
 func applyAuthFileImportDefaults(metadata map[string]any, defaults authFileImportDefaults) bool {
@@ -1088,6 +1158,11 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 			dst = abs
 		}
 	}
+	var err error
+	data, err = preserveExistingAgentIdentityCredentials(dst, data)
+	if err != nil {
+		return err
+	}
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err
@@ -1098,7 +1173,88 @@ func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []b
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
 	}
+	if starter, ok := auth.Runtime.(interface {
+		StartTaskRegistration() (codex.AgentIdentityRegistrationStatus, bool)
+	}); ok && starter != nil {
+		starter.StartTaskRegistration()
+	}
 	return nil
+}
+
+// preserveExistingAgentIdentityCredentials prevents an older incomplete export
+// from downgrading an account that has already recovered. Supplied signing
+// fields must agree with the installed identity before any missing fields are
+// filled from disk.
+func preserveExistingAgentIdentityCredentials(path string, data []byte) ([]byte, error) {
+	incoming := make(map[string]any)
+	if err := json.Unmarshal(data, &incoming); err != nil {
+		return data, nil
+	}
+	incomingCredentials, handled, errIncoming := codex.ParseAgentIdentityMetadata(incoming)
+	if !handled || !errors.Is(errIncoming, codex.ErrAgentIdentityCredentialsMissing) {
+		return data, nil
+	}
+
+	existingData, errRead := os.ReadFile(path)
+	if errors.Is(errRead, os.ErrNotExist) {
+		return data, nil
+	}
+	if errRead != nil {
+		return nil, fmt.Errorf("read existing agent identity auth file: %w", errRead)
+	}
+	existing := make(map[string]any)
+	if err := json.Unmarshal(existingData, &existing); err != nil {
+		return data, nil
+	}
+	existingCredentials, existingHandled, errExisting := codex.ParseAgentIdentityMetadata(existing)
+	if !existingHandled || errExisting != nil ||
+		!sameAgentIdentityAccount(incoming, existing, incomingCredentials, existingCredentials) ||
+		(incomingCredentials.RuntimeID != "" && incomingCredentials.RuntimeID != existingCredentials.RuntimeID) ||
+		(incomingCredentials.PrivateKey != "" && incomingCredentials.PrivateKey != existingCredentials.PrivateKey) {
+		return data, nil
+	}
+
+	incoming["agent_runtime_id"] = existingCredentials.RuntimeID
+	incoming["agent_private_key"] = existingCredentials.PrivateKey
+	if incomingCredentials.TaskID == "" && existingCredentials.TaskID != "" {
+		incoming["task_id"] = existingCredentials.TaskID
+	}
+	delete(incoming, "agent_identity_registration_state")
+	merged, errMarshal := json.MarshalIndent(incoming, "", "  ")
+	if errMarshal != nil {
+		return nil, fmt.Errorf("serialize recovered agent identity auth file: %w", errMarshal)
+	}
+	return append(merged, '\n'), nil
+}
+
+func sameAgentIdentityAccount(
+	incoming map[string]any,
+	existing map[string]any,
+	incomingCredentials codex.AgentIdentityCredentials,
+	existingCredentials codex.AgentIdentityCredentials,
+) bool {
+	if incomingCredentials.RuntimeID != "" && existingCredentials.RuntimeID != "" {
+		return incomingCredentials.RuntimeID == existingCredentials.RuntimeID
+	}
+	incomingAccountID := authMetadataString(incoming, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId")
+	existingAccountID := authMetadataString(existing, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId")
+	if incomingAccountID != "" && existingAccountID != "" {
+		return incomingAccountID == existingAccountID
+	}
+	incomingEmail := authMetadataString(incoming, "email")
+	existingEmail := authMetadataString(existing, "email")
+	return incomingEmail != "" && existingEmail != "" && strings.EqualFold(incomingEmail, existingEmail)
+}
+
+func authMetadataString(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
@@ -1299,7 +1455,8 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("invalid auth file: %w", err)
 	}
-	if _, handled, errAgentIdentity := codex.ParseAgentIdentityMetadata(metadata); handled && errAgentIdentity != nil {
+	if _, handled, errAgentIdentity := codex.ParseAgentIdentityMetadata(metadata); handled && errAgentIdentity != nil &&
+		!errors.Is(errAgentIdentity, codex.ErrAgentIdentityCredentialsMissing) {
 		return nil, fmt.Errorf("invalid agent identity auth file: %w", errAgentIdentity)
 	}
 	provider, _ := metadata["type"].(string)

@@ -114,6 +114,30 @@ type Service struct {
 	homePluginSyncFetch func(context.Context, sdkpluginstore.PluginSyncRequest) (sdkpluginstore.PluginSyncResponse, error)
 }
 
+type authRuntimeUpdateReuser interface {
+	CanReuseForAuthUpdate(next any) bool
+}
+
+type authRuntimeRecoveryStarter interface {
+	StartBackgroundRecovery()
+}
+
+func reusableAuthRuntime(existing, next any) any {
+	if existing == nil || next == nil {
+		return next
+	}
+	if reuser, ok := existing.(authRuntimeUpdateReuser); ok && reuser.CanReuseForAuthUpdate(next) {
+		return existing
+	}
+	return next
+}
+
+func startAuthRuntimeRecovery(runtime any) {
+	if starter, ok := runtime.(authRuntimeRecoveryStarter); ok && starter != nil {
+		starter.StartBackgroundRecovery()
+	}
+}
+
 const (
 	modelRegistrationMaxWorkersPerCategory         = 5
 	modelRegistrationMaxWorkersOpenAICompatibility = 20
@@ -695,6 +719,7 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 	var err error
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
+		auth.Runtime = reusableAuthRuntime(existing.Runtime, auth.Runtime)
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
@@ -716,6 +741,7 @@ func (s *Service) prepareCoreAuthForModelRegistration(ctx context.Context, auth 
 		}
 		auth = current
 	}
+	startAuthRuntimeRecovery(auth.Runtime)
 	return auth
 }
 
