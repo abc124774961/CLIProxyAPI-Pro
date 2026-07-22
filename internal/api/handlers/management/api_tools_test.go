@@ -1,14 +1,254 @@
 package management
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+type apiToolsAgentIdentityRuntime struct {
+	authorization  string
+	taskID         string
+	authorizeErr   error
+	recoverErr     error
+	recoveries     int
+	runtimeDeleted bool
+}
+
+func (r *apiToolsAgentIdentityRuntime) Authorization(context.Context, *http.Client) (string, string, error) {
+	return r.authorization, r.taskID, r.authorizeErr
+}
+
+func (r *apiToolsAgentIdentityRuntime) RecoverAuthorization(context.Context, *http.Client, string) (string, error) {
+	r.recoveries++
+	return "", r.recoverErr
+}
+
+func (r *apiToolsAgentIdentityRuntime) MarkRuntimeDeleted() {
+	r.runtimeDeleted = true
+}
+
+func (r *apiToolsAgentIdentityRuntime) RedactSensitiveBody(body []byte) []byte {
+	redacted := strings.ReplaceAll(string(body), "runtime-secret", "[redacted]")
+	redacted = strings.ReplaceAll(redacted, "task-secret", "[redacted]")
+	return []byte(redacted)
+}
+
+func invokeManagementAPICall(t *testing.T, handler *Handler, payload map[string]any) (int, apiCallResponse) {
+	t.Helper()
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal: %v", errMarshal)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.APICall(ctx)
+
+	var response apiCallResponse
+	if errDecode := json.Unmarshal(recorder.Body.Bytes(), &response); errDecode != nil {
+		t.Fatalf("decode api-call response: %v body=%s", errDecode, recorder.Body.String())
+	}
+	return recorder.Code, response
+}
+
+func TestAPICallAgentIdentityUsesWholeAuthorizationValue(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthorization = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	runtime := &apiToolsAgentIdentityRuntime{
+		authorization: "AgentAssertion signed-value",
+		taskID:        "task-secret",
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "agent", Provider: "codex", Runtime: runtime}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	status, response := invokeManagementAPICall(t, handler, map[string]any{
+		"auth_index": auth.Index,
+		"method":     http.MethodGet,
+		"url":        upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	})
+
+	if status != http.StatusOK || response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d upstream_status=%d body=%s", status, response.StatusCode, response.Body)
+	}
+	if upstreamAuthorization != "AgentAssertion signed-value" {
+		t.Fatalf("Authorization = %q, want complete AgentAssertion", upstreamAuthorization)
+	}
+	if strings.HasPrefix(upstreamAuthorization, "Bearer AgentAssertion ") {
+		t.Fatalf("Authorization has duplicate scheme: %q", upstreamAuthorization)
+	}
+}
+
+func TestAPICallNormalOAuthKeepsBearerTokenReplacement(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "oauth",
+		Provider: "codex",
+		Metadata: map[string]any{"access_token": "oauth-token"},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	status, response := invokeManagementAPICall(t, handler, map[string]any{
+		"auth_index": auth.Index,
+		"method":     http.MethodGet,
+		"url":        upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	})
+
+	if status != http.StatusOK || response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status=%d upstream_status=%d body=%s", status, response.StatusCode, response.Body)
+	}
+	if upstreamAuthorization != "Bearer oauth-token" {
+		t.Fatalf("Authorization = %q, want ordinary bearer token", upstreamAuthorization)
+	}
+}
+
+func TestAPICallAgentIdentityQueuesRejectedTaskWithoutLeakingDetails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":"task_expired","detail":"runtime-secret task-secret"}}`)
+	}))
+	defer upstream.Close()
+
+	runtime := &apiToolsAgentIdentityRuntime{
+		authorization: "AgentAssertion signed-value",
+		taskID:        "task-secret",
+		recoverErr:    codexauth.ErrAgentIdentityRegistrationPending,
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "agent", Provider: "codex", Runtime: runtime}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	status, response := invokeManagementAPICall(t, handler, map[string]any{
+		"auth_index": auth.Index,
+		"method":     http.MethodGet,
+		"url":        upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	})
+
+	if status != http.StatusOK || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d upstream_status=%d body=%s", status, response.StatusCode, response.Body)
+	}
+	if runtime.recoveries != 1 {
+		t.Fatalf("task recoveries = %d, want 1", runtime.recoveries)
+	}
+	if !strings.Contains(response.Body, "agent_identity_registration_pending") ||
+		strings.Contains(response.Body, "runtime-secret") || strings.Contains(response.Body, "task-secret") {
+		t.Fatalf("unsafe or unexpected response body: %s", response.Body)
+	}
+}
+
+func TestAPICallAgentIdentityPendingReturnsSanitizedResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtime := &apiToolsAgentIdentityRuntime{
+		taskID:       "task-secret",
+		authorizeErr: codexauth.ErrAgentIdentityRegistrationPending,
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "agent", Provider: "codex", Runtime: runtime}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	status, response := invokeManagementAPICall(t, handler, map[string]any{
+		"auth_index": auth.Index,
+		"method":     http.MethodGet,
+		"url":        "https://example.invalid/quota",
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	})
+
+	if status != http.StatusOK || response.StatusCode != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body, "agent_identity_registration_pending") {
+		t.Fatalf("status=%d upstream_status=%d body=%s", status, response.StatusCode, response.Body)
+	}
+	if strings.Contains(response.Body, "task-secret") {
+		t.Fatalf("pending response exposed task details: %s", response.Body)
+	}
+}
+
+func TestAPICallAgentIdentityRuntimeDeletedReturnsSanitizedResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"Agent runtime has been deleted: runtime-secret task-secret"}}`)
+	}))
+	defer upstream.Close()
+
+	runtime := &apiToolsAgentIdentityRuntime{
+		authorization: "AgentAssertion signed-value",
+		taskID:        "task-secret",
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "agent", Provider: "codex", Runtime: runtime}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	status, response := invokeManagementAPICall(t, handler, map[string]any{
+		"auth_index": auth.Index,
+		"method":     http.MethodGet,
+		"url":        upstream.URL,
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+		},
+	})
+
+	if status != http.StatusOK || response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d upstream_status=%d body=%s", status, response.StatusCode, response.Body)
+	}
+	if !runtime.runtimeDeleted || !strings.Contains(response.Body, "agent_identity_runtime_deleted") {
+		t.Fatalf("runtime_deleted=%v body=%s", runtime.runtimeDeleted, response.Body)
+	}
+	if strings.Contains(response.Body, "runtime-secret") || strings.Contains(response.Body, "task-secret") {
+		t.Fatalf("runtime-deleted response leaked identity details: %s", response.Body)
+	}
+}
 
 func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
 	t.Parallel()

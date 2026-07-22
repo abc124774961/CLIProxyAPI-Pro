@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,7 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -118,36 +121,28 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
+	httpClient := &http.Client{
+		Timeout:   defaultAPICallTimeout,
+		Transport: h.apiCallTransport(auth),
+	}
 
 	reqHeaders := body.Header
 	if reqHeaders == nil {
 		reqHeaders = map[string]string{}
 	}
 
-	var hostOverride string
-	var token string
-	var tokenResolved bool
-	var tokenErr error
-	for key, value := range reqHeaders {
-		if !strings.Contains(value, "$TOKEN$") {
-			continue
-		}
-		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
-			tokenResolved = true
-		}
-		if auth != nil && token == "" {
-			if tokenErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
-				return
-			}
-			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
+	agentTaskID, agentIdentity, errPrepareHeaders := h.prepareAPICallTokenHeaders(
+		c.Request.Context(),
+		auth,
+		httpClient,
+		reqHeaders,
+	)
+	if errPrepareHeaders != nil {
+		if agentIdentity && writeAgentIdentityAPICallError(c, errPrepareHeaders) {
 			return
 		}
-		if token == "" {
-			continue
-		}
-		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
+		return
 	}
 
 	var requestBody io.Reader
@@ -161,6 +156,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	var hostOverride string
 	for key, value := range reqHeaders {
 		if strings.EqualFold(key, "host") {
 			hostOverride = strings.TrimSpace(value)
@@ -172,13 +168,24 @@ func (h *Handler) APICall(c *gin.Context) {
 		req.Host = hostOverride
 	}
 
-	httpClient := &http.Client{
-		Timeout: defaultAPICallTimeout,
+	var resp *http.Response
+	var errDo error
+	if agentIdentity {
+		resp, errDo = helps.DoCodexRequestWithAgentRecovery(
+			c.Request.Context(),
+			auth,
+			httpClient,
+			httpClient,
+			req,
+			agentTaskID,
+		)
+	} else {
+		resp, errDo = httpClient.Do(req)
 	}
-	httpClient.Transport = h.apiCallTransport(auth)
-
-	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
+		if agentIdentity && writeAgentIdentityAPICallError(c, errDo) {
+			return
+		}
 		log.WithError(errDo).Debug("management APICall request failed")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
 		return
@@ -194,12 +201,108 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	if agentIdentity && codexauth.IsAgentIdentityRuntimeDeletedResponse(resp.StatusCode, respBody) {
+		writeAgentIdentityAPICallError(c, codexauth.ErrAgentIdentityRuntimeDeleted)
+		return
+	}
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func (h *Handler) prepareAPICallTokenHeaders(
+	ctx context.Context,
+	auth *coreauth.Auth,
+	httpClient *http.Client,
+	headers map[string]string,
+) (agentTaskID string, agentIdentity bool, err error) {
+	hasTokenPlaceholder := false
+	for _, value := range headers {
+		if strings.Contains(value, "$TOKEN$") {
+			hasTokenPlaceholder = true
+			break
+		}
+	}
+	if !hasTokenPlaceholder {
+		return "", false, nil
+	}
+
+	if _, ok := helps.CodexAgentIdentityRuntime(auth); ok {
+		for key, value := range headers {
+			if !strings.Contains(value, "$TOKEN$") {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(key), "Authorization") ||
+				!isAgentIdentityAuthorizationTemplate(value) {
+				return "", true, errors.New("invalid agent identity authorization template")
+			}
+		}
+
+		authorization, taskID, errAuthorization := helps.PrepareCodexAuthorization(ctx, auth, httpClient, "")
+		if errAuthorization != nil {
+			return "", true, errAuthorization
+		}
+		for key, value := range headers {
+			if strings.Contains(value, "$TOKEN$") {
+				headers[key] = authorization
+			}
+		}
+		return taskID, true, nil
+	}
+
+	token, errToken := h.resolveTokenForAuth(ctx, auth)
+	if auth != nil && token == "" {
+		if errToken != nil {
+			return "", false, errToken
+		}
+		return "", false, errors.New("auth token not found")
+	}
+	if token == "" {
+		return "", false, nil
+	}
+	for key, value := range headers {
+		if strings.Contains(value, "$TOKEN$") {
+			headers[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+		}
+	}
+	return "", false, nil
+}
+
+func isAgentIdentityAuthorizationTemplate(value string) bool {
+	fields := strings.Fields(value)
+	if len(fields) == 1 {
+		return fields[0] == "$TOKEN$"
+	}
+	return len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") && fields[1] == "$TOKEN$"
+}
+
+func writeAgentIdentityAPICallError(c *gin.Context, err error) bool {
+	if c == nil || err == nil {
+		return false
+	}
+	code := ""
+	message := ""
+	switch {
+	case errors.Is(err, codexauth.ErrAgentIdentityRegistrationPending):
+		code = "agent_identity_registration_pending"
+		message = "Agent identity registration is still pending. Try again shortly."
+	case errors.Is(err, codexauth.ErrAgentIdentityRuntimeDeleted):
+		code = "agent_identity_runtime_deleted"
+		message = "Agent identity is unavailable. Import fresh credentials and try again."
+	default:
+		return false
+	}
+	c.JSON(http.StatusOK, apiCallResponse{
+		StatusCode: http.StatusServiceUnavailable,
+		Header: map[string][]string{
+			"Content-Type": {"application/json"},
+		},
+		Body: fmt.Sprintf(`{"error":{"code":%q,"message":%q}}`, code, message),
+	})
+	return true
 }
 
 func firstNonEmptyString(values ...*string) string {
